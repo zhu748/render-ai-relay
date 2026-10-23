@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { createDiagnostics, VERSION } from './diagnostics.js';
 
 const HOP_HEADERS = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -54,6 +55,7 @@ export function loadConfig(env = process.env) {
     maxBufferedRequestBytes: numberSetting(env, 'MAX_BUFFERED_REQUEST_BYTES', 64 * 1024 * 1024, { min: 1, integer: true }),
     heartbeatPrefixes: (env.HEARTBEAT_PATH_PREFIXES || '').split(',').map(s => s.trim()).filter(Boolean),
     proxyToken: env.PROXY_TOKEN || '',
+    adminToken: env.ADMIN_TOKEN || '',
     tempDirectory: env.TEMP_DIRECTORY || join(tmpdir(), 'render-ai-relay'),
   };
 }
@@ -87,6 +89,25 @@ function requestHint(req, body) {
     } catch { /* malformed input belongs to the upstream */ }
   }
   return 'json';
+}
+
+function heartbeatReason(req, config) {
+  if (!config.heartbeatMs) return 'disabled';
+  if (['HEAD', 'OPTIONS'].includes(req.method)) return 'method';
+  if (req.headers.range) return 'range';
+  if (req.headers['x-proxy-heartbeat'] === 'off') return 'bypass_header';
+  // A page or static resource must never receive speculative JSON whitespace.
+  const destination = req.headers['sec-fetch-dest'];
+  if (req.headers['sec-fetch-mode'] === 'navigate' || (destination && destination !== 'empty') ||
+      /(?:^|,)\s*text\/html(?:\s*;|\s*,|\s*$)/i.test(String(req.headers.accept || ''))) return 'web_resource';
+  const pathname = req.url.split('?', 1)[0];
+  if (config.heartbeatPrefixes.length && !config.heartbeatPrefixes.some(prefix => pathname.startsWith(prefix))) return 'path_excluded';
+  return 'enabled';
+}
+
+function originMatches(value, target) {
+  if (!value) return null;
+  try { return new URL(value).origin === target.origin; } catch { return false; }
 }
 
 function tokenMatches(actual, expected) {
@@ -190,6 +211,7 @@ export function createProxy(config, { logger = console } = {}) {
   };
   let activeRequests = 0;
   let bufferedRequestBytes = 0;
+  const diagnostics = createDiagnostics(config, logger);
   const target = config.target;
   const basePath = target.pathname === '/' ? '' : target.pathname.replace(/\/+$/, '');
 
@@ -198,9 +220,10 @@ export function createProxy(config, { logger = console } = {}) {
     req.on('error', () => {});
     if (req.url.split('?', 1)[0] === '/__proxy_health' && ['GET', 'HEAD'].includes(req.method)) {
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(req.method === 'HEAD' ? undefined : '{"ok":true}\n');
+      res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ ok: true, version: VERSION, diagnostics: '/__proxy/' }) + '\n');
       return;
     }
+    if (diagnostics.handle(req, res)) return;
 
     const controller = new AbortController();
     const { signal } = controller;
@@ -209,6 +232,32 @@ export function createProxy(config, { logger = console } = {}) {
     let upstream, committedKind = null, sentKind = null, receivedBodyBytes = 0;
     let actualBodyStarted = false, lastOutputAt = 0, hint = 'json';
     let admitted = false, requestMemoryBytes = 0;
+    let heartbeats = 0, firstHeartbeatMs = null, eligible = false, reason = 'reading_request', outcome = 'completed';
+    const forwarding = {
+      received_header_names: Object.keys(req.headers).sort(),
+      forwarded_header_names: null,
+      changed_header_names: [],
+      removed_header_names: [],
+      added_header_names: [],
+      request_body_bytes: null,
+      request_body_sent: false,
+      origin_matches_target: originMatches(req.headers.origin, target),
+      referer_matches_target: originMatches(req.headers.referer, target),
+    };
+    const began = performance.now();
+    const trace = diagnostics.begin(req, () => ({
+      phase,
+      heartbeats,
+      first_heartbeat_ms: firstHeartbeatMs,
+      heartbeat_enabled: eligible,
+      heartbeat_reason: reason,
+      upstream_status: upstream?.statusCode ?? null,
+      downstream_status: res.headersSent ? res.statusCode : null,
+      upstream_body_bytes: receivedBodyBytes,
+      ...forwarding,
+    }));
+    res.setHeader('x-render-relay-request-id', trace.id);
+    res.setHeader('x-render-relay-version', VERSION);
     const sseBoundary = createSseBoundary();
 
     const abort = reason => { if (!signal.aborted) controller.abort(reason); };
@@ -234,6 +283,8 @@ export function createProxy(config, { logger = console } = {}) {
         headers['x-accel-buffering'] = 'no';
       }
       if (!upstream) headers['content-type'] = kind === 'sse' ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8';
+      headers['x-render-relay-request-id'] = trace.id;
+      headers['x-render-relay-version'] = VERSION;
       sentKind = kind;
       res.writeHead(upstream?.statusCode || 200, headers);
       if (modifying) res.flushHeaders();
@@ -252,6 +303,11 @@ export function createProxy(config, { logger = console } = {}) {
       // LF LF is valid JSON whitespace and an ignored blank SSE event.
       res.write('\n\n');
       lastOutputAt = performance.now();
+      heartbeats++;
+      if (heartbeats === 1) {
+        firstHeartbeatMs = Math.round(lastOutputAt - began);
+        trace.event('heartbeat_started');
+      }
       return config.heartbeatMs;
     }
 
@@ -310,21 +366,26 @@ export function createProxy(config, { logger = console } = {}) {
         return true;
       });
       if (signal.aborted) throw signal.reason;
+      forwarding.request_body_bytes = body.length;
       hint = requestHint(req, body);
-      const pathname = req.url.split('?', 1)[0];
-      const eligible = config.heartbeatMs > 0 && !['HEAD', 'OPTIONS'].includes(req.method) && !req.headers.range &&
-        req.headers['x-proxy-heartbeat'] !== 'off' &&
-        (config.heartbeatPrefixes.length === 0 || config.heartbeatPrefixes.some(prefix => pathname.startsWith(prefix)));
+      reason = heartbeatReason(req, config);
+      eligible = reason === 'enabled';
       const headers = filterHeaders(req.headers);
       delete headers['x-proxy-token'];
       delete headers['x-proxy-heartbeat'];
+      delete headers['x-admin-token'];
       headers.host = target.host;
       if (body.length || req.headers['content-length'] !== undefined || req.headers['transfer-encoding'] !== undefined) {
         headers['content-length'] = String(body.length);
       }
       // An injected plain LF must not be followed by compressed response bytes.
       if (eligible) headers['accept-encoding'] = 'identity';
+      forwarding.forwarded_header_names = Object.keys(headers).sort();
+      forwarding.changed_header_names = Object.keys(headers).filter(name => req.headers[name] !== undefined && String(req.headers[name]) !== String(headers[name])).sort();
+      forwarding.removed_header_names = Object.keys(req.headers).filter(name => headers[name] === undefined).sort();
+      forwarding.added_header_names = Object.keys(headers).filter(name => req.headers[name] === undefined).sort();
       phase = 'waiting_headers';
+      trace.event('upstream_request');
       if (eligible) scheduleHeartbeat(config.firstHeartbeatMs);
       if (config.totalTimeoutMs > 0) {
         totalTimer = setTimeout(() => abort(new ProxyError(504, 'upstream_timeout', 'Upstream request exceeded UPSTREAM_TIMEOUT_SECONDS')), config.totalTimeoutMs);
@@ -356,7 +417,7 @@ export function createProxy(config, { logger = console } = {}) {
           else socket.once(target.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectTimer));
         });
         outgoing.on('error', reject);
-        outgoing.once('finish', releaseRequestMemory);
+        outgoing.once('finish', () => { forwarding.request_body_sent = true; releaseRequestMemory(); });
         outgoing.once('close', releaseRequestMemory);
         outgoing.on('upgrade', (_response, socket) => {
           socket.destroy();
@@ -365,13 +426,14 @@ export function createProxy(config, { logger = console } = {}) {
         outgoing.end(body);
       });
 
+      trace.event('upstream_headers');
       const kind = eligible ? responseKind(upstream, req.method) : null;
       if (committedKind && (kind !== committedKind || (committedKind === 'sse' && upstream.statusCode !== 200))) {
         upstream.destroy();
         throw new ProxyError(502, 'incompatible_upstream_response', `Upstream returned HTTP ${upstream.statusCode} with a format incompatible with the already-started ${committedKind} response`);
       }
       if (committedKind && upstream.statusCode !== res.statusCode) {
-        logger.warn?.(JSON.stringify({ event: 'late_upstream_status', upstream_status: upstream.statusCode, downstream_status: res.statusCode }));
+        trace.event('late_upstream_status', {}, 'warn');
       }
 
       if (kind === 'json') {
@@ -414,6 +476,7 @@ export function createProxy(config, { logger = console } = {}) {
         res.end();
       } else {
         // Binary, compressed, no-body and explicitly bypassed responses stay opaque.
+        if (eligible) { eligible = false; reason = 'upstream_format'; }
         phase = 'passthrough';
         commit(null, false);
         await pipeline(upstream, res, { signal });
@@ -421,8 +484,9 @@ export function createProxy(config, { logger = console } = {}) {
       phase = 'done';
     } catch (caught) {
       const error = signal.aborted ? signal.reason : caught;
+      outcome = error?.status === 499 ? 'client_disconnected' : 'relay_error';
       if (!res.destroyed && error?.status !== 499) {
-        logger.error?.(JSON.stringify({ event: 'relay_error', code: error?.code || 'upstream_connection_error', status: error?.status || 502, phase, syscall: error?.syscall }));
+        trace.event('relay_error', { code: error?.code || 'upstream_connection_error', status: error?.status || 502, syscall: error?.syscall }, 'error');
       }
       sendFailure(error instanceof ProxyError ? error : new ProxyError(502, 'upstream_connection_error', 'Upstream connection failed or response was interrupted'));
       abort(error);
@@ -434,6 +498,7 @@ export function createProxy(config, { logger = console } = {}) {
       if (outgoing && !outgoing.writableFinished) outgoing.destroy();
       releaseRequestMemory();
       if (admitted) activeRequests--;
+      trace.end(outcome);
       if (temporaryDirectory) {
         await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => logger.error?.('{"event":"temporary_file_cleanup_failed"}'));
       }

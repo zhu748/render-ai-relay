@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 中转 · 运行诊断</title>
+<style>
+  :root { color-scheme: light; font: 15px/1.6 system-ui, sans-serif; color: #182535; background: #f2f5f8; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; }
+  header { background: #152c42; color: white; padding: 26px max(24px, calc((100vw - 1152px)/2)); }
+  header p { color: #c8d8e6; margin: 4px 0 0; }
+  h1 { font-size: 26px; margin: 0; }
+  h2 { font-size: 19px; margin: 0 0 12px; }
+  main { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
+  section { background: white; border: 1px solid #dce3ea; border-radius: 12px; padding: 22px; margin: 18px 0; }
+  p { margin: 8px 0; }
+  .muted { color: #526578; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  input, select { padding: 10px 12px; border: 1px solid #a6b4c2; border-radius: 6px; font: inherit; width: min(100%, 400px); }
+  select { width: 100%; }
+  pre { font: 13px/1.8 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; background: #f2f6f9; padding: 16px; border-radius: 8px; }
+  button { border: 0; border-radius: 6px; padding: 11px 16px; background: #155f9b; color: white; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.secondary { background: #e7edf3; color: #183951; }
+  #status { min-height: 25px; white-space: pre-wrap; }
+  .error { color: #ae2432; }
+  .good { color: #146c45; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 16px 0; }
+  .card { padding: 14px 18px; border-radius: 8px; background: #f2f6f9; overflow-wrap: anywhere; }
+  .value { display: block; font-size: 21px; font-weight: 650; }
+  code { font-size: .9em; background: #edf2f6; padding: 2px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+  .scroll { overflow: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; white-space: nowrap; }
+  th, td { text-align: left; padding: 9px 11px; border-bottom: 1px solid #e7edf2; }
+  th { color: #526578; background: #f7f9fb; }
+  td.path { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+  #probe-result { white-space: pre-wrap; font-variant-numeric: tabular-nums; }
+  ol { padding-left: 24px; }
+  footer { color: #526578; margin: 25px 0 35px; font-size: 13px; }
+</style>
+<header><h1>AI 中转 · 运行诊断</h1><p>查看真正经过本中转的请求，以及等待期间是否发出了心跳。</p></header>
+<main>
+  <section>
+    <h2>连接中转后台</h2>
+    <p class="muted">在 Render → 当前服务 → Environment 中查看或设置 <code>ADMIN_TOKEN</code>。密钥只保留在当前页面内存中。</p>
+    <div class="row"><label for="token">管理密钥</label><input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="ADMIN_TOKEN"><button id="connect">连接并刷新</button><button id="disconnect" class="secondary" disabled>断开</button></div>
+    <p id="status" role="status">请输入管理密钥。这里不使用目标站的 API Key。</p>
+    <div id="summary" class="cards" hidden></div>
+    <p id="target" class="muted"></p>
+  </section>
+  <section>
+    <h2>正在进行的请求</h2>
+    <p class="muted">连接后每 2 秒更新。页面不显示目标站内部未经过 Render 的请求。</p>
+    <div class="scroll"><table><thead><tr><th>请求 ID</th><th>方法 / 路径</th><th>当前阶段</th><th>已等待</th><th>心跳次数</th><th>上游 HTTP</th><th>心跳状态</th></tr></thead><tbody id="active"><tr><td colspan="7">尚未连接</td></tr></tbody></table></div>
+  </section>
+  <section>
+    <h2>请求透传核对</h2>
+    <p class="muted">只显示请求头名称和调整项，不显示密钥等请求头的值。Origin / Referer 与目标站不同仅为排查提示，不能单独判断失败原因。</p>
+    <label for="request-select">选择请求</label><select id="request-select"><option value="">暂无记录</option></select>
+    <pre id="request-detail">连接后台并发送一次实际请求后，可查看正文长度、关键请求头和转发差异。</pre>
+  </section>
+  <section>
+    <h2>心跳链路测试</h2>
+    <p class="muted">本地模拟等待，不请求目标站、不消耗模型额度。通过 CF 域名打开此页面再测试，可检查该域名到 Render 的心跳链路。</p>
+    <div class="row"><button id="probe-short" disabled>测试 10 秒</button><button id="probe-long" class="secondary" disabled>测试 135 秒</button><button id="probe-stop" class="secondary" disabled>停止测试</button></div>
+    <p id="probe-result" role="status">测试通过仅说明这一段链路可传输空白，目标站内部的请求仍需单独排查。</p>
+  </section>
+  <section>
+    <h2>最近 200 条事件</h2>
+    <div class="scroll"><table><thead><tr><th>时间</th><th>请求 ID</th><th>事件</th><th>方法 / 路径</th><th>阶段</th><th>耗时</th><th>心跳</th><th>上游 / 中转 HTTP</th><th>结果 / 原因</th></tr></thead><tbody id="events"><tr><td colspan="9">尚未连接</td></tr></tbody></table></div>
+  </section>
+  <section>
+    <h2>怎么定位这次 126 秒错误</h2>
+    <ol>
+      <li>连接后台后，在客户端再次发起一次非流式请求。</li>
+      <li>完全没有对应记录：检查客户端请求地址，或网页是否使用原域名直接请求接口。</li>
+      <li>有记录，心跳次数持续增加，目标站却报错：检查目标站内部访问 AI 上游的连接。Render 的心跳无法修复另一段连接的断开。</li>
+      <li>记录出现错误：查看上游 HTTP、阶段和错误码。也可在 Render → 当前服务 → Logs 中按完整请求 ID 搜索。</li>
+    </ol>
+  </section>
+  <footer>日志只保留在当前实例内存，重启会清空；多实例各自记录。不会记录请求正文、响应正文、认证头、Cookie 或 URL 查询串。根路径继续转发目标网站。</footer>
+</main>
+<script src="/__proxy/admin.js" defer></script>
+</html>

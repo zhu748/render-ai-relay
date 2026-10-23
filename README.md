@@ -2,9 +2,9 @@
 
 部署在 Render 的固定目标 HTTP 反向代理，专门处理 AI 接口长时间等待的问题。只需配置目标域名；不登记渠道，不登记模型，不转换 AI 协议，不改写请求正文。
 
-**只要还没有实际正文可以交给客户端，就发送空白换行保活。流式和非流式都覆盖，也不需要等上游先返回响应头。** 默认转交请求后 1 秒发送首个空白，之后空闲时每 1 秒一次。将 `HEARTBEAT_START_DELAY_SECONDS=0` 可立即发送第一个空白。
+**对可保活的 JSON / SSE 请求，只要还没有实际正文可以交给客户端，就发送空白换行。流式和非流式都覆盖，也不需要等上游先返回响应头。** 默认转交请求后 1 秒发送首个空白，之后空闲时每 1 秒一次。将 `HEARTBEAT_START_DELAY_SECONDS=0` 可立即发送第一个空白。
 
-版本 **1.1.0**。本项目已经完成本地验证，尚未连接你的真实目标站、部署到你的 Render 账户或经过你的 Cloudflare 域名。
+版本 **1.2.0**。本项目已经完成本地验证，尚未连接你的真实目标站、部署到你的 Render 账户或经过你的 Cloudflare 域名。
 
 仓库：[zhu748/render-ai-relay](https://github.com/zhu748/render-ai-relay)。
 
@@ -17,12 +17,37 @@
 1. 点击上面的 **Deploy to Render** 按钮；或在 Render 选择 **New → Blueprint**，连接 `zhu748/render-ai-relay`。
 2. 如果使用自己的仓库，先 Fork 本仓库，或将 `render-ai-relay` 文件夹**里面的文件**上传到仓库根目录；`package.json` 和 `render.yaml` 应直接位于根目录。
 3. 创建时填写唯一必填项 `TARGET_URL`，例如 `https://your-ai-site.example`。
-4. 等待部署完成，访问 `https://你的服务.onrender.com/__proxy_health`，应返回 `{"ok":true}`。
+4. 等待部署完成，访问 `https://你的服务.onrender.com/__proxy_health`，应返回包含 `ok: true` 和版本号的 JSON。
 5. 将客户端的 API Base URL 换成中转域名，**API Key 仍填写目标站原来的 Key**。模型名和请求参数也保持原来的值。
 
 提供的 `render.yaml` 使用 Free 实例用于开始测试，没有数据库和持久磁盘。需要长期运行时，可在 Render 中选择适合自己的实例类型。
 
 Blueprint 默认关闭跟随源码推送的自动部署，便于自行决定何时更新；可在 Render 控制台开启自动部署。
+
+### 查看后台与升级现有服务
+
+**根路径 `/` 继续转发目标网站。中转自己的管理页面是 `https://你的中转域名/__proxy/`。** 目标网站内显示的日志属于目标网站，不是本项目的运行日志。
+
+1. 已部署旧版的服务：在 Render → 当前服务 → **Environment** 添加 `ADMIN_TOKEN`，值设为你自己的随机管理密钥。这不是目标站 API Key，也不是 GitHub Token。
+2. 在 **Manual Deploy → Deploy latest commit** 部署最新代码。源码推送不会自动更新关闭了自动部署的实例。
+3. 打开 `/__proxy/`，输入 `ADMIN_TOKEN` 连接。使用 Blueprint 新建服务会自动生成该环境变量，可在 Render 的 Environment 中查看。
+4. 再发一次实际非流式请求，查看它是否出现、处于哪一阶段、发出了几次心跳，以及上游 / 中转各自的 HTTP 状态码。
+
+后台显示当前实例的活动请求和最近 200 条事件，每 2 秒刷新。日志保存在内存，进程重启后清空，多实例之间不共享。未设置 `ADMIN_TOKEN` 时可打开帮助页面，但不能读取日志或运行测试。管理密钥只通过 `X-Admin-Token` 请求头发送，不接受 URL 参数，不写入浏览器持久存储，也不转发到目标站。
+
+“请求透传核对”可以选择一条请求，查看收到 / 发出的请求头名称、调整 / 移除 / 新增的头名称、原始正文长度、正文是否已提交给上游连接，以及 Origin / Referer 是否与目标站同源。不记录这些头的值；“已提交”不代表上游已成功处理，“不同源”也不代表请求一定失败。
+
+管理页提供 10 秒 / 135 秒模拟等待测试，等待期间按同样的心跳配置输出空白，最后返回 JSON。通过 CF 域名打开页面再测试，可以观察首字节时间、实际收到的数据块和最大接收间隔。**测试不会调用目标站，不消耗模型额度；它只检查访问域名到 Render 这一段，不能证明目标站内部的 AI 请求正常。** 测试同时最多两条，每条最多 180 秒，停止测试会清理计时器。
+
+无需打开管理页也能查看日志：Render → 当前 Web Service → **Logs**。项目现在主动记录 `request_received`、`upstream_request`、`heartbeat_started`、`upstream_headers`、`relay_error` 和 `request_finished`，包含相同的 `request_id`。响应头中的 `X-Render-Relay-Request-Id` 可用于对应查找；`X-Render-Relay-Version` 可核对部署版本。
+
+### 页面能打开，不代表接口一定经过中转
+
+本项目转发根路径时会原样返回目标 HTML，不修改 HTML、JavaScript 内的 URL、Cookie 域、CSP 或重定向地址。如果目标网页写着 `fetch('https://原目标域名/api')`、使用原域名的 `<base>`，或跳转回原域名，那一段请求可能绕开中转。应将实际 API Base URL 配为中转地址；只有进入中转的请求才会出现在这里。
+
+浏览器从中转域名打开网页时，请求的来源与 Cookie 行为也可能变化。项目保留**收到的** `Origin` / `Referer` 值，不自动改成目标域名；浏览器没有发送的原域名 Cookie 无法由中转补回。目标站 `Set-Cookie` 中原有的 Domain 和 Path 也不会改写。因此，请求正文和业务头透传不等于完整复制原域名浏览器会话。目标站若校验来源、登录状态、IP 或 proof 与会话的关联，需要对照真实请求单独处理。
+
+如果日志显示本中转持续发心跳，但目标站自己的浏览器桥接器访问 Google 等上游时仍在约 126 秒失败，需要检查目标站内部连接。外层中转发出的空白不能重置另一段连接的读取超时，也不会把原始非流式请求偷偷改成流式。
 
 ### 手动创建 Web Service
 
@@ -70,7 +95,7 @@ Render Free 在连续 15 分钟无入站流量时会休眠，下次请求有冷�
 - `Host` / TLS SNI 使用目标域名。逐跳请求头按 HTTP 规则移除；传输长度按原始正文计算。支持保活的请求会把 `Accept-Encoding` 设为 `identity`，避免将空白混进压缩数据。
 - 目标响应的 JSON 正文保持原始字节，只在前面追加空白；SSE 保留原事件字节，仅在安全边界插入空白。HTTP 版本、请求头大小写和顺序不保证与直连逐字节一致。
 
-没有额外的 CORS 改写；目标站 CORS 头按下面的响应头限制透传。WebSocket、CONNECT 隧道以及任意二进制格式的心跳不在本项目范围内。
+没有额外的 CORS 改写；目标站 CORS 头按下面的响应头限制透传。尤其是在目标响应头之前提前发心跳时，上游稍后返回的 CORS 头无法补发；浏览器跨域调用需要事先配置好允许跨域的外层服务，或采用同源调用。WebSocket、CONNECT 隧道以及任意二进制格式的心跳不在本项目范围内。
 
 ## 心跳行为
 
@@ -78,7 +103,7 @@ Render Free 在连续 15 分钟无入站流量时会休眠，下次请求有冷�
 
 从请求发送给目标站开始计时。默认 1 秒后还没有实际正文时，就提交响应并发送两个真实的 LF 字节，即 `\n\n`（不是反斜杠文字）。之后每隔 1 秒继续发送。
 
-请求内 `stream: true` 或 `Accept: text/event-stream` 对应 SSE 响应头；其余请求先按 JSON 处理。两个空白换行既是合法的 JSON 前置空白，也是 SSE 中会被忽略的空事件。
+请求内 `stream: true` 或 `Accept: text/event-stream` 对应 SSE 响应头；其余可保活请求先按 JSON 处理。两个空白换行既是合法的 JSON 前置空白，也是 SSE 中会被忽略的空事件。浏览器页面导航、`Accept: text/html` 和 `Sec-Fetch-Dest` 指明的网页 / 静态资源会直接透传，避免把慢网页错误地声明成 JSON。
 
 如果目标站实际上返回 NDJSON、HTML、下载文件或其他格式，而上游响应头又非常晚，本项目无法凭空预知格式。请将这些路径排除保活，见下文的前缀设置或单次绕过。
 
@@ -121,8 +146,9 @@ Render Free 在连续 15 分钟无入站流量时会休眠，下次请求有冷�
 | `TEMP_DIRECTORY` | 系统临时目录下的 `render-ai-relay` | 自动创建的独立临时文件根目录，可指定其他可写目录 |
 | `HEARTBEAT_PATH_PREFIXES` | 空 | 逗号分隔的客户端路径前缀；空表示所有普通路径；例如 `/v1/,/api/` |
 | `PROXY_TOKEN` | 空 | 可选的中转访问密钥，客户端放在 `X-Proxy-Token`，不替代上游 Authorization |
+| `ADMIN_TOKEN` | 空；Blueprint 新建时自动生成 | 独立管理密钥，用于 `/__proxy/` 的日志与心跳测试，空值禁用诊断数据访问 |
 
-默认所有普通方法都可保活，不要求请求体一定是 JSON 或带 `stream: false`。`HEAD`、`OPTIONS`、带 `Range` 的请求以及健康检查不插入空白。
+默认所有普通方法都可保活，不要求请求体一定是 JSON 或带 `stream: false`。`HEAD`、`OPTIONS`、带 `Range` 的请求、网页导航 / 已标明的静态资源以及健康检查不插入空白。`/__proxy` 与 `/__proxy/` 路径前缀保留给管理功能，不向目标站转发。
 
 单次请求需要保持完全透明时，可以添加 `X-Proxy-Heartbeat: off`。这个控制头和 `X-Proxy-Token` 都会在转发到目标站前移除。已明确识别为二进制、压缩、无正文或部分内容的响应也不注入空白；如果此前已经开始了猜测格式的心跳，则按不兼容响应处理。
 
@@ -175,12 +201,14 @@ node scripts/slow-check.js
 
 JSON 临时文件不需要持久磁盘。空 JSON 或仅含空白的 JSON 响应会转换为明确的 `empty_upstream_response` 错误；SSE 在安全事件边界断开时会尽量发送错误事件。
 
-日志不记录请求正文、响应正文、Authorization、Cookie 或 URL 查询串。不自动重试请求，避免 AI 生成被重复提交。
+日志包含方法、路径（不含查询串，最多 256 字符）、阶段、耗时、心跳计数和状态码，不记录请求正文、响应正文、Authorization、Cookie 或其他认证头。请不要把密钥放进路径本身。不自动重试请求，避免 AI 生成被重复提交。
 
 ## 文件
 
 - `src/proxy.js`：原始请求转发、心跳、JSON 暂存、SSE 安全转发与连接清理。
 - `src/server.js`：Render 启动入口、端口配置与退出处理。
+- `src/diagnostics.js`：受管理密钥保护的运行状态、最近事件和流式心跳测试。
+- `src/admin.html` / `src/admin.js`：`/__proxy/` 诊断管理页。
 - `render.yaml`：Render Blueprint。
 - `.env.example`：可选配置示例。
 - `Dockerfile`：Docker 部署。
@@ -194,5 +222,6 @@ JSON 临时文件不需要持久磁盘。空 JSON 或仅含空白的 JSON 响应
 - [Render Blueprint YAML](https://render.com/docs/blueprint-spec)
 - [Render Cloudflare DNS 配置](https://render.com/docs/configure-cloudflare-dns)
 - [Render Free 实例限制](https://render.com/docs/free)
+- [Render 日志](https://render.com/docs/logging)
 - [Cloudflare 524](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/)
 - [RFC 8259：JSON 语法与空白](https://www.rfc-editor.org/rfc/rfc8259.html#section-2)

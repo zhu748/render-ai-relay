@@ -1,4 +1,5 @@
 import { createProxy, loadConfig } from './proxy.js';
+import { VERSION } from './diagnostics.js';
 
 let config;
 try {
@@ -15,7 +16,7 @@ server.on('error', error => {
   process.exitCode = 1;
 });
 server.listen(config.port, '0.0.0.0', () => {
-  console.log(JSON.stringify({ event: 'listening', port: server.address().port, heartbeat_seconds: config.heartbeatMs / 1000 }));
+  console.log(JSON.stringify({ event: 'listening', version: VERSION, port: server.address().port, heartbeat_seconds: config.heartbeatMs / 1000, diagnostics: '/__proxy/', admin_configured: Boolean(config.adminToken) }));
 });
 
 let stopping = false;
