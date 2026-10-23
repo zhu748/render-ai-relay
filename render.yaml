@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: render-ai-relay
+    runtime: node
+    plan: free
+    autoDeployTrigger: "off"
+    buildCommand: npm ci --omit=dev && npm run check
+    startCommand: npm start
+    healthCheckPath: /__proxy_health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: TARGET_URL
+        sync: false
+      - key: HEARTBEAT_START_DELAY_SECONDS
+        value: "1"
+      - key: HEARTBEAT_INTERVAL_SECONDS
+        value: "1"
+      - key: UPSTREAM_TIMEOUT_SECONDS
+        value: "1800"
+      - key: CONNECT_TIMEOUT_SECONDS
+        value: "30"
+      - key: MAX_CONCURRENT_REQUESTS
+        value: "32"
+      - key: MAX_BUFFERED_REQUEST_BYTES
+        value: "67108864"
