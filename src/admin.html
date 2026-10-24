@@ -50,6 +50,16 @@
     <p id="target" class="muted"></p>
   </section>
   <section>
+    <h2>部署保活</h2>
+    <p class="muted">定时向指定地址发送轻量 GET 请求。可填本实例的 <code>/keepalive</code>，该端点不访问目标站、不消耗模型额度。留空 URL 后保存可关闭。</p>
+    <p><label for="keepalive-url">保活 URL</label><br><input id="keepalive-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://你的服务.onrender.com/keepalive" disabled></p>
+    <p><label for="keepalive-interval">间隔（秒，5–86400）</label><br><input id="keepalive-interval" type="number" min="5" max="86400" step="1" value="60" disabled></p>
+    <div class="row"><button id="keepalive-current" class="secondary" disabled>使用当前服务地址</button><button id="keepalive-save" disabled>保存并应用</button></div>
+    <p id="keepalive-config-status" class="muted" role="status">连接后台后可设置。面板保存仅对当前实例有效；重启后沿用环境变量 KEEPALIVE_URL、KEEPALIVE_INTERVAL。非空环境变量锁定对应字段。</p>
+    <p id="keepalive-result" role="status">尚未连接</p>
+    <p class="muted">断开后台页面不会关闭部署保活。进程休眠或停止后自身任务也会停止，此功能不保证平台始终在线。</p>
+  </section>
+  <section>
     <h2>正在进行的请求</h2>
     <p class="muted">连接后每 2 秒更新。页面不显示目标站内部未经过 Render 的请求。</p>
     <div class="scroll"><table><thead><tr><th>请求 ID</th><th>方法 / 路径</th><th>当前阶段</th><th>已等待</th><th>心跳次数</th><th>上游 HTTP</th><th>心跳状态</th></tr></thead><tbody id="active"><tr><td colspan="7">尚未连接</td></tr></tbody></table></div>

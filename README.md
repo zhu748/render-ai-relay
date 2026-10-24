@@ -4,7 +4,7 @@
 
 **对可保活的 JSON / SSE 请求，只要还没有实际正文可以交给客户端，就发送空白换行。流式和非流式都覆盖，也不需要等上游先返回响应头。** 默认转交请求后 1 秒发送首个空白，之后空闲时每 1 秒一次。将 `HEARTBEAT_START_DELAY_SECONDS=0` 可立即发送第一个空白。
 
-版本 **1.2.0**。本项目已经完成本地验证，尚未连接你的真实目标站、部署到你的 Render 账户或经过你的 Cloudflare 域名。
+版本 **1.5.0**。本项目已经完成本地验证，尚未连接你的真实目标站、部署到你的 Render 账户或经过你的 Cloudflare 域名。
 
 仓库：[zhu748/render-ai-relay](https://github.com/zhu748/render-ai-relay)。
 
@@ -34,6 +34,8 @@ Blueprint 默认关闭跟随源码推送的自动部署，便于自行决定何�
 4. 再发一次实际非流式请求，查看它是否出现、处于哪一阶段、发出了几次心跳，以及上游 / 中转各自的 HTTP 状态码。
 
 后台显示当前实例的活动请求和最近 200 条事件，每 2 秒刷新。日志保存在内存，进程重启后清空，多实例之间不共享。未设置 `ADMIN_TOKEN` 时可打开帮助页面，但不能读取日志或运行测试。管理密钥只通过 `X-Admin-Token` 请求头发送，不接受 URL 参数，不写入浏览器持久存储，也不转发到目标站。
+
+后台同时显示请求正文内存、JSON 响应暂存量、SSE 缓冲量及各自上限。请求详情还显示是否复用上游连接、是否正在等待下游读取。连接尚未完成时也可以断开；重连、断开会取消旧的状态请求和心跳测试。心跳测试超过预定时长 15 秒仍未结束时，会报告链路超时；实例退出期间显示退出状态并禁用新测试。
 
 “请求透传核对”可以选择一条请求，查看收到 / 发出的请求头名称、调整 / 移除 / 新增的头名称、原始正文长度、正文是否已提交给上游连接，以及 Origin / Referer 是否与目标站同源。不记录这些头的值；“已提交”不代表上游已成功处理，“不同源”也不代表请求一定失败。
 
@@ -87,13 +89,43 @@ Cloudflare 回源到的是 Render 上的这个项目，项目再连接目标 AI 
 
 Render Free 在连续 15 分钟无入站流量时会休眠，下次请求有冷启动等待；**进程还没启动时，本项目无法发送心跳**。Free 实例也可能重启，心跳不是长期可用性的保证。
 
+## 部署保活：定时访问 URL
+
+支持参考 gcli2api 保活机制实现的定时 GET 探测。部署保活定时访问指定 URL，请求心跳在等待 AI 响应时发送空白；两项功能独立配置。
+
+### 使用环境变量
+
+在 Render → 当前服务 → Environment 中添加以下配置，再重新部署：
+
+```dotenv
+KEEPALIVE_URL=https://你的服务.onrender.com/keepalive
+KEEPALIVE_INTERVAL=60
+KEEPALIVE_TIMEOUT_SECONDS=30
+```
+
+也可将 URL 配为自己通过 Cloudflare 访问的域名，例如 `https://relay.example.com/keepalive`。填写完整 HTTP(S) 地址。不要填写模型生成接口或代理根路径；配置的地址会实际收到 GET 请求。
+
+`/keepalive` 是本实例的轻量公开端点，GET / HEAD 返回空正文和 HTTP 200，不要求中转密钥、不占转发名额、不访问目标站。其他方法返回 405；实例退出期间返回 503。外层 CDN 应放行该路径并避免缓存，服务响应已设置 `Cache-Control: no-store`。
+
+URL 留空时默认不创建后台探测任务。启用后服务开始监听才发出首次探测，随后从上一条探测结束起等待指定间隔，始终串行。每次有独立的总超时，收到 HTTP 响应头即结束，不下载整个正文，不自动跟随重定向。2xx 记为成功；其他状态或网络错误记为失败，并在下一正常间隔继续探测。退出或更改配置会取消旧请求和计时器。
+
+### 使用管理页
+
+打开 `/__proxy/`，输入 `ADMIN_TOKEN`，在“部署保活”中填写 URL 和间隔，或点击“使用当前服务地址”，再“保存并应用”。清空 URL 后保存即可关闭。页面显示运行状态、请求次数、最近状态码和错误码；断开管理页面不会关闭服务端保活任务。
+
+**面板修改只对当前实例生效，进程重启后恢复环境变量配置。** 非空 `KEEPALIVE_URL` / `KEEPALIVE_INTERVAL` 优先，并锁定对应的面板字段；需要修改时编辑环境变量后重新部署。空值不锁定字段。Blueprint 默认提供空 URL 和 60 秒间隔，因此新服务不会自动向外部发请求；如需从面板调整默认间隔，可先清空相应环境变量并重新部署。
+
+保活 URL 只向持有管理密钥的设置接口返回，不出现在运行日志或通用状态数据中；探测不会携带目标站 API Key、中转密钥或管理密钥。
+
+此任务随进程运行。进程已休眠、停止或被平台杀掉时，自身任务也会停止；它不能保证免费实例始终在线，也不能延长单次 AI 请求的总超时。
+
 ## 怎样保持请求原样
 
 - HTTP 方法、路径、查询参数、请求正文原始字节保持不变。即使请求正文内有特殊 JSON 格式、空格、自定义字段、未知模型名，也不会重建 JSON。
 - `Authorization`、`x-api-key`、`Cookie` 和自定义业务请求头透传。不在服务端保存或替换你的目标站 Key。
 - 读取请求内的 `stream: true` 仅用于在尚无上游响应头时判断应声明 JSON 还是 SSE，**不会修改这个字段**。也可以用 `Accept: text/event-stream` 指示 SSE。
 - `Host` / TLS SNI 使用目标域名。逐跳请求头按 HTTP 规则移除；传输长度按原始正文计算。支持保活的请求会把 `Accept-Encoding` 设为 `identity`，避免将空白混进压缩数据。
-- 目标响应的 JSON 正文保持原始字节，只在前面追加空白；SSE 保留原事件字节，仅在安全边界插入空白。HTTP 版本、请求头大小写和顺序不保证与直连逐字节一致。
+- 目标响应的 JSON 正文保持原始字节，只在前面追加空白；SSE 保留原事件字节，仅在安全边界插入空白。如果已提前发过心跳，会移除上游开头可选的 UTF-8 BOM，防止它被当成首条事件字段的一部分；未提前发心跳时保留 BOM。HTTP 版本、请求头大小写和顺序不保证与直连逐字节一致。
 
 没有额外的 CORS 改写；目标站 CORS 头按下面的响应头限制透传。尤其是在目标响应头之前提前发心跳时，上游稍后返回的 CORS 头无法补发；浏览器跨域调用需要事先配置好允许跨域的外层服务，或采用同源调用。WebSocket、CONNECT 隧道以及任意二进制格式的心跳不在本项目范围内。
 
@@ -115,9 +147,13 @@ Render Free 在连续 15 分钟无入站流量时会休眠，下次请求有冷�
 
 ### SSE 流式
 
-目标事件到达后，立即按照背压逐块转发。没有实际输出时，定时发送空白；但**若上游停在一个未结束的 SSE 事件中间，暂不插入空白**，以免截断该事件。
+**未完成的 SSE 事件暂存在中转内，完整事件到达后立即按背压转发。** 因而上游即使停在半条 `data:` 字段内部，中转也可以在客户端当前的安全边界继续发送空白，不必等待上游补齐事件。仅包含注释的完整行可以立即透传；事件内部的注释与对应事件一起转发。
 
-因此，上游若把一个事件发送一半后长期沉默，仍可能触发中间层的超时。普通完整 SSE 事件之间的长等待会由空白保活覆盖。
+支持跨网络数据块拆分的 UTF-8 BOM、CR、LF 和 CRLF。识别 BOM 时最多暂存两个前缀字节，不会把心跳插入 UTF-8 BOM 内部；只收到完整 BOM 时，仍会继续保活。
+
+单个事件默认上限 16 MiB，所有请求的 SSE 缓冲共享 64 MiB 预算；缓冲采用固定大小块，避免大量微小分块造成对象堆积。大事件尚在等待下游排空时仍占用预算。超限会返回明确的 SSE 错误，取消、超时和完成都会释放预算。图片等大事件可按需调整上限。
+
+如果上游在未完成的事件、字段行或 BOM 前缀中结束，会报告 `incomplete_sse_event`，不会把半条字段接到错误事件前面，也不会将它记为成功。中转不解释模型的 `[DONE]`、finish_reason 或业务完成条件；完整事件之后的正常 EOF 仍由业务客户端判断是否完成。关闭心跳时仍采用原始字节透传，不做事件缓冲与完整性检查。
 
 ### 状态码和响应头的取舍
 
@@ -125,7 +161,7 @@ Render Free 在连续 15 分钟无入站流量时会休眠，下次请求有冷�
 
 **如果已经在目标响应头到来前开始发心跳，HTTP 200 和猜测的 Content-Type 就已经提交，之后无法修改。** 后续才知道的响应头（例如 `Set-Cookie`、速率限制头）也不能补发。目标站后续返回 JSON 错误时，原始错误 JSON 会接在空白后，客户端需要检查正文，不能只检查 HTTP 200。
 
-如果目标站随后返回与已提交格式不兼容的内容，项目会返回可解析的 `relay_error`，而不会把 HTML 或 gzip 字节接进 JSON。连接错误、总超时、超出响应大小上限等错误也会尽量以 JSON 或 SSE 错误事件结束；已传输一半的 SSE 事件发生错误时会直接关闭连接。
+如果目标站随后返回与已提交格式不兼容的内容，项目会返回可解析的 `relay_error`，而不会把 HTML 或 gzip 字节接进 JSON。连接错误、总超时、超出响应大小上限等错误也会尽量以 JSON 或 SSE 错误事件结束；已经开始传输的 JSON / 透明正文发生错误时，只能关闭连接，避免在半条正文中追加错误。
 
 这是提前发送响应正文的 HTTP 限制。若需要严格保留目标状态码和所有响应头，请关闭保活；关闭后将重新面临长等待超时。
 
@@ -137,20 +173,30 @@ Render Free 在连续 15 分钟无入站流量时会休眠，下次请求有冷�
 | `PORT` | `10000` | 监听端口，Render 会提供 |
 | `HEARTBEAT_START_DELAY_SECONDS` | `1` | 首个空白前等待秒数；`0` 表示立即发送；最大 `60` |
 | `HEARTBEAT_INTERVAL_SECONDS` | `1` | 后续空白间隔；`0` 关闭保活；最大 `60` |
+| `KEEPALIVE_URL` | 空 | 部署保活 URL；空值默认禁用，填写本实例公开的 `/keepalive` 地址即可启用；非空环境变量锁定面板 URL 字段 |
+| `KEEPALIVE_INTERVAL` | `60` | 每次探测结束后的等待秒数，整数 5–86400；非空环境变量锁定面板间隔字段 |
+| `KEEPALIVE_TIMEOUT_SECONDS` | `30` | 单次部署保活总超时，1–300 秒；不影响 AI 转发期限 |
 | `UPSTREAM_TIMEOUT_SECONDS` | `1800` | 整次上游请求总期限，心跳不延长它；`0` 不设置总期限 |
 | `CONNECT_TIMEOUT_SECONDS` | `30` | 建立上游 TCP / TLS 连接的期限 |
+| `TCP_KEEPALIVE_SECONDS` | `15` | 两侧 TCP keepalive 的首次探测延迟，1–300 秒；不代替应用层心跳 |
+| `UPSTREAM_IDLE_SOCKET_TIMEOUT_SECONDS` | `15` | 回收空闲上游连接，最大 300 秒；复用时清除该期限，不影响活动 AI 请求；也遵循更短的上游 Keep-Alive 提示 |
+| `DOWNSTREAM_STALL_TIMEOUT_SECONDS` | `120` | 连续等待下游排空写入队列的期限，最大 3600 秒；`0` 关闭；不会因上游尚无数据而触发 |
+| `SHUTDOWN_GRACE_SECONDS` | `25` | 退出时等待已有请求完成的秒数，0–300；不得超过平台实际终止宽限期；之后额外保留最多 1 秒发送错误与清理 |
 | `MAX_REQUEST_BYTES` | `33554432` | 原始请求正文大小上限，32 MiB |
 | `MAX_JSON_RESPONSE_BYTES` | `268435456` | 单个临时 JSON 响应大小上限，256 MiB |
 | `MAX_CONCURRENT_REQUESTS` | `32` | 同时处理的转发请求上限，含正在上传的请求 |
 | `MAX_BUFFERED_REQUEST_BYTES` | `67108864` | 所有请求正文共享的 64 MiB 内存预算 |
+| `MAX_BUFFERED_RESPONSE_BYTES` | `536870912` | 当前进程所有临时 JSON 响应共享的 512 MiB 暂存预算，发送期间继续占用，删除文件后释放 |
+| `MAX_SSE_EVENT_BYTES` | `16777216` | 单个 SSE 事件上限，16 MiB |
+| `MAX_BUFFERED_SSE_BYTES` | `67108864` | 当前进程共享的 SSE 正文缓冲预算，64 MiB；这是逻辑正文大小，不是进程 RSS |
 | `TEMP_DIRECTORY` | 系统临时目录下的 `render-ai-relay` | 自动创建的独立临时文件根目录，可指定其他可写目录 |
 | `HEARTBEAT_PATH_PREFIXES` | 空 | 逗号分隔的客户端路径前缀；空表示所有普通路径；例如 `/v1/,/api/` |
 | `PROXY_TOKEN` | 空 | 可选的中转访问密钥，客户端放在 `X-Proxy-Token`，不替代上游 Authorization |
 | `ADMIN_TOKEN` | 空；Blueprint 新建时自动生成 | 独立管理密钥，用于 `/__proxy/` 的日志与心跳测试，空值禁用诊断数据访问 |
 
-默认所有普通方法都可保活，不要求请求体一定是 JSON 或带 `stream: false`。`HEAD`、`OPTIONS`、带 `Range` 的请求、网页导航 / 已标明的静态资源以及健康检查不插入空白。`/__proxy` 与 `/__proxy/` 路径前缀保留给管理功能，不向目标站转发。
+默认所有普通方法都可保活，不要求请求体一定是 JSON 或带 `stream: false`。`HEAD`、`OPTIONS`、带 `Range` 的请求、网页导航 / 已标明的静态资源以及健康检查不插入空白。`/__proxy` 与 `/__proxy/` 路径前缀保留给管理功能；`/keepalive` 保留给部署探测，均不向目标站转发。
 
-单次请求需要保持完全透明时，可以添加 `X-Proxy-Heartbeat: off`。这个控制头和 `X-Proxy-Token` 都会在转发到目标站前移除。已明确识别为二进制、压缩、无正文或部分内容的响应也不注入空白；如果此前已经开始了猜测格式的心跳，则按不兼容响应处理。
+单次请求需要保持完全透明时，可以添加 `X-Proxy-Heartbeat: off`。这个控制头和 `X-Proxy-Token` 都会在转发到目标站前移除。已明确识别为二进制、压缩、无正文、部分内容或显式声明非 UTF-8 / US-ASCII 字符集的 JSON 响应也不注入空白；如果此前已经开始了猜测格式的心跳，则按不兼容响应处理。
 
 压缩的请求正文仍会按原始字节发送，但无法直接从压缩数据中读出 `stream`。此类 SSE 请求请同时提供 `Accept: text/event-stream`，或者绕过保活。
 
@@ -189,9 +235,11 @@ npm start
 ```bash
 npm run check
 node scripts/slow-check.js
+# 模拟上游在半条 SSE 事件内停顿 135 秒
+SMOKE_RESPONSE_KIND=sse node scripts/slow-check.js
 ```
 
-`npm run check` 运行语法检查与集成测试；Render Blueprint 在构建时也执行这组检查。GitHub Actions 会在推送和拉取请求时执行相同检查，再进行 5 秒模拟慢请求测试，所用 GitHub Actions 已固定到提交 SHA。
+`npm run check` 运行语法检查与集成测试；Render Blueprint 在构建时也执行这组检查。GitHub Actions 会在推送和拉取请求时执行相同检查，再分别进行 5 秒 JSON 等待与半条 SSE 事件等待测试，所用 GitHub Actions 已固定到提交 SHA。
 
 `slow-check.js` 在本机创建模拟上游，故意等 135 秒才返回响应头，使用默认 1 秒首包和 1 秒心跳，在客户端启用 3 秒读空闲超时，验证最终 JSON 保持不变。这是本地链路测试，不等于已经验证你的 Render / CF / 目标站完整链路。
 
@@ -199,13 +247,26 @@ node scripts/slow-check.js
 
 服务默认最多接收 32 个并发转发请求，请求正文共享 64 MiB 内存预算；超出时在访问目标站前返回 HTTP 503 和 `Retry-After: 1`。客户端上传中断时会释放资源；正文发送给目标站后即释放内存预算，不会在模型推理期间一直占用。健康检查不占用转发名额。
 
+请求头已声明正文超过 `MAX_REQUEST_BYTES` 时，无需等待上传即可返回 413。提前拒绝尚未上传完的请求时，中转在错误响应发出后关闭连接，避免继续接收无限上传。
+
+JSON 响应除单条上限外，还受当前进程共享暂存预算限制。超出共享预算时返回 `response_storage_limit`，错误中的状态为 503；此前未发心跳时，HTTP 状态也为 503，并包含 `Retry-After: 1`。取消、超时和正常完成都会清理临时文件，删除完成后才释放暂存预算和并发名额；删除失败会保留对应预算并记录清理失败事件。该预算不统计进程启动前遗留的临时文件。
+
 JSON 临时文件不需要持久磁盘。空 JSON 或仅含空白的 JSON 响应会转换为明确的 `empty_upstream_response` 错误；SSE 在安全事件边界断开时会尽量发送错误事件。
 
-日志包含方法、路径（不含查询串，最多 256 字符）、阶段、耗时、心跳计数和状态码，不记录请求正文、响应正文、Authorization、Cookie 或其他认证头。请不要把密钥放进路径本身。不自动重试请求，避免 AI 生成被重复提交。
+两侧连接开启 TCP keepalive；上游空闲连接默认 15 秒回收，优先复用最近使用的连接，并参考上游更短的 Keep-Alive 提示，降低复用陈旧连接的风险。活动请求不受空闲连接池期限影响。TCP 探测不能延长 Cloudflare 的 HTTP 超时或复活已断开的连接。
+
+如果客户端持续不排空写入队列，默认 120 秒后记录 `downstream_stalled`，关闭该连接并取消对应上游、释放资源。这是持续等待 drain 的期限；极慢的客户端可按需提高或关闭此保护。
+
+收到 `SIGTERM` / `SIGINT` 后进入退出状态，健康检查返回 503，新转发与测试请求停止接受，已有响应继续处理，并及时关闭随之空闲的 keep-alive 连接。默认宽限 25 秒；到期后在可解析的 JSON / SSE 边界发送 `server_shutting_down`，取消上游并清理，额外最多 1 秒后强制终止。已发送部分透明正文的连接及不读取错误的客户端只能关闭。平台若更早强制杀进程，应用无法再发送错误。不支持的 Upgrade / CONNECT 请求在拒绝响应发出后直接释放连接，不等待客户端关闭。
+
+日志包含方法、路径（不含查询串，最多 256 字符）、阶段、耗时、心跳计数和状态码，不记录请求正文、响应正文、Authorization、Cookie 或其他认证头。请不要把密钥放进路径本身。不自动重放转发请求，避免 AI 生成被重复提交。部署保活独立记录 `keepalive_started`、`keepalive_result` 和 `keepalive_stopped`，不记录 URL、查询串或响应正文。
 
 ## 文件
 
 - `src/proxy.js`：原始请求转发、心跳、JSON 暂存、SSE 安全转发与连接清理。
+- `src/sse.js`：有容量上限的 SSE 事件缓冲、BOM、换行和完整性检查。
+- `src/errors.js`：统一的中转错误类型。
+- `src/keepalive.js`：URL 定时 GET 探测、环境变量优先、超时与任务清理。
 - `src/server.js`：Render 启动入口、端口配置与退出处理。
 - `src/diagnostics.js`：受管理密钥保护的运行状态、最近事件和流式心跳测试。
 - `src/admin.html` / `src/admin.js`：`/__proxy/` 诊断管理页。
@@ -213,6 +274,10 @@ JSON 临时文件不需要持久磁盘。空 JSON 或仅含空白的 JSON 响应
 - `.env.example`：可选配置示例。
 - `Dockerfile`：Docker 部署。
 - `test/proxy.test.js`：本地集成测试。
+- `test/admin.test.js`：管理页连接、重连、取消和测试超时的交互逻辑测试。
+- `test/server.test.js`：真实进程启动、配置错误保密和退出排空测试。
+- `test/sse.test.js`：事件分块、换行、UTF-8、注释、容量与 EOF 检查。
+- `test/keepalive.test.js`：定时探测、禁用、超时、取消、非重叠、配置变更和敏感信息保护。
 - `scripts/slow-check.js`：135 秒真实等待验证。
 - `.github/workflows/ci.yml`：GitHub 自动检查与短时间心跳验证。
 
@@ -225,3 +290,6 @@ JSON 临时文件不需要持久磁盘。空 JSON 或仅含空白的 JSON 响应
 - [Render 日志](https://render.com/docs/logging)
 - [Cloudflare 524](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/)
 - [RFC 8259：JSON 语法与空白](https://www.rfc-editor.org/rfc/rfc8259.html#section-2)
+- [WHATWG SSE 解析规则](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream)
+- [Node.js 24 HTTP 连接池与超时](https://nodejs.org/docs/latest-v24.x/api/http.html)
+- [gcli2api 旧版部署保活机制参考](https://github.com/su-kaka/agy2api/blob/faead1475c40f9bfca44a94ecfa38e83065a9eb7/src/keeplive.py)：参考定时访问 URL 的机制，使用独立 Node.js 实现；未引入 Python 项目或依赖。

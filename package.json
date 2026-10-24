@@ -1,14 +1,16 @@
 {
   "name": "render-ai-relay",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "private": true,
   "description": "Fixed-upstream HTTP relay with whitespace heartbeats for AI JSON and SSE responses",
   "type": "module",
-  "engines": { "node": ">=24 <25" },
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "start": "node --env-file-if-exists=.env src/server.js",
     "test": "node --test",
     "test:slow": "node scripts/slow-check.js",
-    "check": "node --check src/proxy.js && node --check src/server.js && node --check src/diagnostics.js && node --check src/admin.js && node --test"
+    "check": "node --check src/proxy.js && node --check src/server.js && node --check src/diagnostics.js && node --check src/admin.js && node --check src/sse.js && node --check src/errors.js && node --check src/keepalive.js && node --test"
   }
 }

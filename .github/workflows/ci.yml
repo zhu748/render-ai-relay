@@ -30,3 +30,8 @@ jobs:
         run: npm run test:slow
         env:
           SMOKE_DELAY_SECONDS: '5'
+      - name: Verify heartbeats inside a partial SSE event
+        run: npm run test:slow
+        env:
+          SMOKE_DELAY_SECONDS: '5'
+          SMOKE_RESPONSE_KIND: sse

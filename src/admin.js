@@ -2,14 +2,18 @@ const $ = id => document.getElementById(id);
 let token = '';
 let session = 0;
 let timer;
+let refreshController;
 let probeController;
 let connected = false;
+let keepaliveSettings = null;
+let keepaliveController;
 let requests = new Map();
 const phases = { reading_request: '接收请求', waiting_headers: '等待上游响应头', buffering_json: '接收完整 JSON', sending_json: '返回 JSON', sse: '转发 SSE', passthrough: '直接透传', done: '完成' };
 const names = { request_received: '收到请求', upstream_request: '已转发上游', heartbeat_started: '首个心跳已发出', upstream_headers: '收到上游响应头', late_upstream_status: '上游状态码晚到', relay_error: '中转错误', request_finished: '请求结束' };
 const reasons = { reading_request: '尚在接收请求', enabled: '已启用', disabled: '配置关闭', method: 'HEAD / OPTIONS', range: 'Range 请求', bypass_header: '请求头关闭', path_excluded: '路径未匹配', web_resource: '网页 / 静态资源', upstream_format: '上游格式直接透传' };
 const seconds = ms => `${(ms / 1000).toFixed(1)} 秒`;
 const shown = value => value ?? '—';
+const mib = bytes => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 
 function status(message, kind = '') {
   $('status').textContent = message;
@@ -39,10 +43,17 @@ function table(id, rows, width) {
 }
 
 function render(data) {
+  renderKeepaliveStatus(data.keepalive);
   const summary = $('summary');
   summary.hidden = false;
   summary.replaceChildren();
-  for (const [label, value] of [ ['版本', data.version], ['活动请求', data.active.length], ['累计请求', data.total_requests], ['心跳间隔', seconds(data.heartbeat_interval_ms)], ['首个心跳', seconds(data.first_heartbeat_ms)] ]) {
+  const cards = [ ['版本', data.version], ['活动请求', data.active.length], ['累计请求', data.total_requests], ['心跳间隔', seconds(data.heartbeat_interval_ms)], ['首个心跳', seconds(data.first_heartbeat_ms)] ];
+  if (data.resources) {
+    cards.push(['请求内存 / 上限', `${mib(data.resources.buffered_request_bytes)} / ${mib(data.resources.max_buffered_request_bytes)}`]);
+    cards.push(['响应暂存 / 上限', `${mib(data.resources.buffered_response_bytes)} / ${mib(data.resources.max_buffered_response_bytes)}`]);
+    cards.push(['SSE 缓冲 / 上限', `${mib(data.resources.buffered_sse_bytes)} / ${mib(data.resources.max_buffered_sse_bytes)}`]);
+  }
+  for (const [label, value] of cards) {
     const card = document.createElement('div');
     card.className = 'card';
     const strong = document.createElement('span');
@@ -84,49 +95,133 @@ function showRequest() {
     `新增的请求头：${list(record.added_header_names)}`,
     `Origin 与目标站同源：${sameOrigin(record.origin_matches_target)}`,
     `Referer 与目标站同源：${sameOrigin(record.referer_matches_target)}`,
+    `SSE 当前缓冲：${record.buffered_sse_bytes ?? 0} 字节`,
+    `复用上游连接：${record.upstream_reused_socket ? '是' : '否'}`,
+    `正在等待下游读取：${record.downstream_backpressure ? '是' : '否'}`,
   ].join('\n');
 }
 $('request-select').addEventListener('change', showRequest);
 
-async function refresh(current) {
+function renderKeepaliveStatus(data) {
+  if (!data) { $('keepalive-result').textContent = '未配置部署保活'; return; }
+  const state = !data.configured ? '未配置' : data.running ? (data.in_flight ? '正在请求' : '运行中') : '已停止';
+  const last = data.last_attempt_at ? new Date(data.last_attempt_at).toLocaleTimeString() : '尚未请求';
+  $('keepalive-result').textContent = `${state} · 间隔 ${data.interval_seconds} 秒 · 请求次数 ${data.attempts} · 最近请求 ${last} · HTTP ${shown(data.last_status)}${data.last_error_code ? ' · ' + data.last_error_code : ''}`;
+}
+
+function keepaliveControls() {
+  const ready = connected && keepaliveSettings && !keepaliveController;
+  $('keepalive-url').disabled = !ready;
+  $('keepalive-interval').disabled = !ready;
+  $('keepalive-url').readOnly = Boolean(keepaliveSettings?.locked.url);
+  $('keepalive-interval').readOnly = Boolean(keepaliveSettings?.locked.interval);
+  $('keepalive-current').disabled = !ready || Boolean(keepaliveSettings?.locked.url);
+  $('keepalive-save').disabled = !ready || Boolean(keepaliveSettings?.locked.url && keepaliveSettings?.locked.interval);
+}
+
+function resetKeepalive() {
+  keepaliveController?.abort();
+  keepaliveController = undefined;
+  keepaliveSettings = null;
+  $('keepalive-url').value = '';
+  $('keepalive-interval').value = '60';
+  $('keepalive-result').textContent = '尚未连接';
+  $('keepalive-config-status').textContent = '面板设置仅对当前实例有效；重启后请通过环境变量 KEEPALIVE_URL、KEEPALIVE_INTERVAL 保留配置。';
+  keepaliveControls();
+}
+
+async function keepaliveRequest(current, value) {
+  const controller = new AbortController();
+  keepaliveController = controller;
+  keepaliveControls();
   try {
-    const response = await fetch('/__proxy/status', { headers: { 'X-Admin-Token': token }, cache: 'no-store', signal: AbortSignal.timeout(15000) });
+    const response = await fetch('/__proxy/keepalive', {
+      method: value ? 'PUT' : 'GET',
+      headers: { 'X-Admin-Token': token, ...(value ? { 'Content-Type': 'application/json' } : {}) },
+      ...(value ? { body: JSON.stringify(value) } : {}),
+      cache: 'no-store', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
+    });
     const data = await response.json();
     if (current !== session) return;
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    connected = true;
+    keepaliveSettings = data;
+    $('keepalive-url').value = data.url;
+    $('keepalive-interval').value = String(data.interval_seconds);
+    renderKeepaliveStatus(data.status);
+    const locked = [data.locked.url && 'KEEPALIVE_URL', data.locked.interval && 'KEEPALIVE_INTERVAL'].filter(Boolean);
+    $('keepalive-config-status').textContent = locked.length
+      ? `环境变量托管：${locked.join('、')}；修改对应字段需编辑环境变量并重启。`
+      : value ? '已保存并应用。仅对当前实例生效，重启后请通过环境变量保留配置。' : '可设置保活 URL。面板保存仅对当前实例生效。';
+  } catch (error) {
+    if (current === session) $('keepalive-config-status').textContent = `保活配置失败：${error.message}`;
+  } finally {
+    if (keepaliveController === controller) keepaliveController = undefined;
+    keepaliveControls();
+  }
+}
+
+$('keepalive-current').addEventListener('click', () => {
+  $('keepalive-url').value = `${location.origin}/keepalive`;
+});
+$('keepalive-save').addEventListener('click', () => {
+  if (!connected || !keepaliveSettings || keepaliveController) return;
+  void keepaliveRequest(session, { url: $('keepalive-url').value, interval_seconds: Number($('keepalive-interval').value) });
+});
+
+async function refresh(current) {
+  const controller = new AbortController();
+  refreshController = controller;
+  try {
+    const response = await fetch('/__proxy/status', { headers: { 'X-Admin-Token': token }, cache: 'no-store', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
+    const data = await response.json();
+    if (current !== session) return;
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const draining = Boolean(data.resources?.draining);
+    connected = !draining;
     render(data);
-    status(`已连接 · ${new Date().toLocaleTimeString()} 更新`, 'good');
+    status(draining ? '实例正在退出，已停止接受新的转发和测试请求。' : `已连接 · ${new Date().toLocaleTimeString()} 更新`, draining ? 'error' : 'good');
     $('disconnect').disabled = false;
-    $('probe-short').disabled = Boolean(probeController);
-    $('probe-long').disabled = Boolean(probeController);
+    $('probe-short').disabled = Boolean(probeController) || draining;
+    $('probe-long').disabled = Boolean(probeController) || draining;
+    keepaliveControls();
+    if (connected && !keepaliveSettings && !keepaliveController) void keepaliveRequest(current);
     timer = setTimeout(() => refresh(current), 2000);
   } catch (error) {
     if (current !== session) return;
     connected = false;
+    keepaliveControls();
     status(error.message, 'error');
     $('probe-short').disabled = true;
     $('probe-long').disabled = true;
     // Retry network interruptions; auth/config errors need an explicit reconnect.
     if (error.name === 'TypeError' || error.name === 'TimeoutError') timer = setTimeout(() => refresh(current), 5000);
+  } finally {
+    if (refreshController === controller) refreshController = undefined;
   }
 }
 
 $('connect').addEventListener('click', () => {
   const current = ++session;
   connected = false;
+  resetKeepalive();
   clearTimeout(timer);
+  refreshController?.abort();
   probeController?.abort();
+  $('probe-short').disabled = true;
+  $('probe-long').disabled = true;
   token = $('token').value || token;
   $('token').value = '';
   if (!token) { status('请输入 ADMIN_TOKEN。', 'error'); return; }
+  $('disconnect').disabled = false;
   status('正在连接…');
   void refresh(current);
 });
 $('disconnect').addEventListener('click', () => {
   session++;
   connected = false;
+  resetKeepalive();
   clearTimeout(timer);
+  refreshController?.abort();
   probeController?.abort();
   token = '';
   $('token').value = '';
@@ -141,11 +236,14 @@ $('disconnect').addEventListener('click', () => {
   requests.clear();
   $('request-select').replaceChildren();
   showRequest();
+  $('probe-result').textContent = '已断开，心跳测试已停止。';
   status('已断开。');
 });
 $('token').addEventListener('keydown', event => { if (event.key === 'Enter') $('connect').click(); });
 
 async function runProbe(duration) {
+  if (!connected || probeController) return;
+  const current = session;
   const controller = new AbortController();
   probeController = controller;
   $('probe-short').disabled = true;
@@ -159,11 +257,12 @@ async function runProbe(duration) {
   let size = 0;
   let raw = '';
   const show = result => {
+    if (current !== session) return;
     $('probe-result').textContent = `${result}\n首字节：${first === undefined ? '等待中' : seconds(first)} · 最大接收间隔：${seconds(maximum)} · 收到数据块：${chunks} · 字节：${size}`;
   };
   show(`正在测试 ${duration} 秒…`);
   try {
-    const response = await fetch(`/__proxy/probe?seconds=${duration}`, { headers: { 'X-Admin-Token': token }, cache: 'no-store', signal: controller.signal });
+    const response = await fetch(`/__proxy/probe?seconds=${duration}`, { headers: { 'X-Admin-Token': token }, cache: 'no-store', signal: AbortSignal.any([controller.signal, AbortSignal.timeout((duration + 15) * 1000)]) });
     if (!response.ok) {
       const data = await response.json();
       throw new Error(data.error || `HTTP ${response.status}`);
@@ -184,10 +283,11 @@ async function runProbe(duration) {
     }
     raw += decoder.decode();
     const result = JSON.parse(raw);
+    if (result.error) throw new Error(typeof result.error === 'string' ? result.error : result.error.message || result.error.code);
     if (!result.ok || !result.probe) throw new Error('未收到有效的诊断结果');
     show(`测试完成：服务端发送 ${result.heartbeats} 次心跳。请结合首字节和最大接收间隔判断是否存在缓冲。`);
   } catch (error) {
-    show(error.name === 'AbortError' ? '测试已停止。' : `测试失败：${error.message}`);
+    show(error.name === 'AbortError' ? '测试已停止。' : error.name === 'TimeoutError' ? '测试超时，请检查访问链路是否中断或缓冲。' : `测试失败：${error.message}`);
   } finally {
     if (probeController === controller) {
       probeController = undefined;

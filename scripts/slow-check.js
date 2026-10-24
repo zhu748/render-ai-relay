@@ -6,15 +6,23 @@ import { createProxy, loadConfig } from '../src/proxy.js';
 
 const delaySeconds = Number(process.env.SMOKE_DELAY_SECONDS || 135);
 const verbose = process.env.SMOKE_VERBOSE === '1';
+const kind = process.env.SMOKE_RESPONSE_KIND || 'json';
 if (!Number.isFinite(delaySeconds) || delaySeconds < 1) throw new Error('Invalid SMOKE_DELAY_SECONDS');
-const expected = JSON.stringify({ model: 'custom-model', response: 'slow response completed', delay_seconds: delaySeconds });
+if (!['json', 'sse'].includes(kind)) throw new Error('Invalid SMOKE_RESPONSE_KIND');
+const json = JSON.stringify({ model: 'custom-model', response: 'slow response completed', delay_seconds: delaySeconds });
+const expected = kind === 'sse' ? `data: ${json}\n\ndata: [DONE]\n\n` : json;
+const split = expected.indexOf('slow response') + 5;
 const timers = new Set();
 const origin = http.createServer((req, res) => {
   req.resume();
+  if (kind === 'sse') {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(expected.slice(0, split));
+  }
   const timer = setTimeout(() => {
     timers.delete(timer);
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(expected);
+    if (kind === 'json') res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(kind === 'sse' ? expected.slice(split) : expected);
   }, delaySeconds * 1000);
   timers.add(timer);
   res.once('close', () => { clearTimeout(timer); timers.delete(timer); });
@@ -46,21 +54,22 @@ try {
     // A real read-idle deadline shorter than the overall upstream wait.
     outgoing.setTimeout(3_000, () => outgoing.destroy(new Error('3-second read-idle timeout')));
     outgoing.on('error', reject);
-    outgoing.end('{ "model": "custom-model", "stream": false }');
+    outgoing.end(`{ "model": "custom-model", "stream": ${kind === 'sse'} }`);
   });
   assert.equal(result.status, 200);
   assert.equal(result.body.trimStart(), expected);
-  assert.deepEqual(JSON.parse(result.body), JSON.parse(expected));
+  if (kind === 'json') assert.deepEqual(JSON.parse(result.body), JSON.parse(expected));
   assert.ok(times[0] < 5000);
   const gaps = times.map((time, index) => time - (index ? times[index - 1] : 0));
   assert.ok(Math.max(...gaps) < 3_000);
   console.log(JSON.stringify({
     verified: true,
+    response_kind: kind,
     duration_seconds: +((performance.now() - started) / 1000).toFixed(2),
     first_byte_ms: Math.round(times[0]),
     max_gap_ms: Math.round(Math.max(...gaps)),
     received_chunks: times.length,
-    json_body_unchanged: true,
+    ...(kind === 'json' ? { json_body_unchanged: true } : { sse_events_unchanged: true, paused_inside_event: true }),
   }));
 } finally {
   for (const timer of timers) clearTimeout(timer);

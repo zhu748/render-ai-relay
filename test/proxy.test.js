@@ -1,23 +1,50 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { once } from 'node:events';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { createProxy, loadConfig } from '../src/proxy.js';
+import { VERSION } from '../src/diagnostics.js';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const silentLogger = { error() {}, warn() {} };
+
+async function waitFor(check) {
+  const deadline = performance.now() + 2000;
+  while (performance.now() < deadline) {
+    const value = await check();
+    if (value) return value;
+    await delay(10);
+  }
+  assert.fail('Timed out waiting for observable resource state');
+}
 
 async function fixture(t, handle, overrides = {}, logger = silentLogger) {
   const origin = http.createServer((req, res) => {
     Promise.resolve(handle(req, res)).catch(error => res.destroy(error));
   });
+  let relay, directory;
+  // Register cleanup before setup: a failed temp-directory/listen step must
+  // not leave a listening server keeping the entire test process alive.
+  t.after(async () => {
+    if (relay) {
+      relay.server.closeAllConnections();
+      relay.destroyAgents();
+      await new Promise(resolve => relay.server.close(resolve));
+    }
+    origin.closeAllConnections();
+    await new Promise(resolve => origin.close(resolve));
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
   origin.listen(0, '127.0.0.1');
   await once(origin, 'listening');
-  const directory = await mkdtemp(join(tmpdir(), 'relay-test-'));
+  directory = await mkdtemp(join(tmpdir(), 'relay-test-'));
   const config = {
     ...loadConfig({
       TARGET_URL: `http://127.0.0.1:${origin.address().port}`,
@@ -28,18 +55,10 @@ async function fixture(t, handle, overrides = {}, logger = silentLogger) {
     tempDirectory: directory,
     ...overrides,
   };
-  const relay = createProxy(config, { logger });
+  relay = createProxy(config, { logger });
   relay.server.listen(0, '127.0.0.1');
   await once(relay.server, 'listening');
-  t.after(async () => {
-    relay.server.closeAllConnections();
-    relay.destroyAgents();
-    await new Promise(resolve => relay.server.close(resolve));
-    origin.closeAllConnections();
-    await new Promise(resolve => origin.close(resolve));
-    await rm(directory, { recursive: true, force: true });
-  });
-  return { url: `http://127.0.0.1:${relay.server.address().port}`, originUrl: `http://127.0.0.1:${origin.address().port}`, config, directory };
+  return { url: `http://127.0.0.1:${relay.server.address().port}`, originUrl: `http://127.0.0.1:${origin.address().port}`, origin, relay, server: relay.server, config, directory };
 }
 
 function request(url, { method = 'POST', body = '{"model":"custom-model","stream":false}', headers = {}, onChunk, rawPath } = {}) {
@@ -381,6 +400,9 @@ test('configuration rejects unsupported targets and invalid timeout values', () 
   }
   assert.throws(() => loadConfig({ TARGET_URL: 'https://host', HEARTBEAT_INTERVAL_SECONDS: '125' }));
   assert.throws(() => loadConfig({ TARGET_URL: 'https://host', PORT: '-1' }));
+  for (const [name, value] of Object.entries({ TCP_KEEPALIVE_SECONDS: '0', UPSTREAM_IDLE_SOCKET_TIMEOUT_SECONDS: '0', DOWNSTREAM_STALL_TIMEOUT_SECONDS: '-1', SHUTDOWN_GRACE_SECONDS: '301', MAX_SSE_EVENT_BYTES: '0', MAX_BUFFERED_SSE_BYTES: '0' })) {
+    assert.throws(() => loadConfig({ TARGET_URL: 'https://host', [name]: value }), new RegExp(name));
+  }
 });
 
 test('defaults use one-second heartbeats and bounded request resources', () => {
@@ -389,6 +411,13 @@ test('defaults use one-second heartbeats and bounded request resources', () => {
   assert.equal(config.firstHeartbeatMs, 1000);
   assert.equal(config.maxConcurrentRequests, 32);
   assert.equal(config.maxBufferedRequestBytes, 64 * 1024 * 1024);
+  assert.equal(config.maxBufferedResponseBytes, 512 * 1024 * 1024);
+  assert.equal(config.tcpKeepAliveMs, 15000);
+  assert.equal(config.upstreamIdleSocketMs, 15000);
+  assert.equal(config.downstreamStallMs, 120000);
+  assert.equal(config.shutdownGraceMs, 25000);
+  assert.equal(config.maxSseEventBytes, 16 * 1024 * 1024);
+  assert.equal(config.maxBufferedSseBytes, 64 * 1024 * 1024);
   assert.throws(() => loadConfig({ TARGET_URL: 'https://host', MAX_CONCURRENT_REQUESTS: '0' }));
 });
 
@@ -510,14 +539,14 @@ test('SSE activity resets the heartbeat deadline without skipping a full interva
   const f = await fixture(t, async (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('data: {"n":1}\n\n');
-    await delay(137);
+    await delay(411);
     res.write('data: {"n":2}\n\n');
-    await delay(223);
+    await delay(669);
     res.end('data: [DONE]\n\n');
-  }, { heartbeatMs: 100, firstHeartbeatMs: 20 });
+  }, { heartbeatMs: 300, firstHeartbeatMs: 20 });
   const result = await request(f.url + '/stream', { body: '{"stream":true}' });
   const gaps = result.times.slice(1).map((time, i) => time - result.times[i]);
-  assert.ok(Math.max(...gaps) < 150, `unexpected heartbeat gap: ${Math.max(...gaps)}ms`);
+  assert.ok(Math.max(...gaps) < 450, `unexpected heartbeat gap: ${Math.max(...gaps)}ms`);
 });
 
 test('missing temporary storage directories are created automatically', async t => {
@@ -554,7 +583,7 @@ test('the diagnostics page is independent of the target and protects its data wi
   assert.equal(hits, 0);
   const health = JSON.parse((await get('/__proxy_health')).body);
   assert.equal(health.diagnostics, '/__proxy/');
-  assert.equal(health.version, '1.2.0');
+  assert.equal(health.version, VERSION);
 });
 
 test('request diagnostics are disabled unless an ADMIN_TOKEN is configured', async t => {
@@ -779,4 +808,443 @@ test('compressed request bodies remain the original bytes without stream re-seri
   assert.deepEqual(seen.body, raw);
   assert.equal(seen.headers['content-encoding'], 'gzip');
   assert.equal(Number(seen.headers['content-length']), raw.length);
+});
+
+test('a split SSE BOM cannot hide the first event after speculative heartbeats', async t => {
+  const events = 'data: {"first":true}\n\ndata: [DONE]\n\n';
+  const f = await fixture(t, async (_req, res) => {
+    await delay(80);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const byte of [0xef, 0xbb, 0xbf]) {
+      res.write(Buffer.from([byte]));
+      await delay(10);
+    }
+    res.end(events);
+  });
+  const result = await request(f.url + '/stream', { body: '{"stream":true}' });
+  assert.match(result.body.toString(), /^\n\n/);
+  assert.ok(!result.body.includes(Buffer.from([0xef, 0xbb, 0xbf])));
+  assert.equal(result.body.toString().trimStart(), events);
+});
+
+test('an initial SSE BOM stays intact and does not block idle heartbeats', async t => {
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const f = await fixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(bom);
+    await delay(140);
+    res.end('data: [DONE]\n\n');
+  });
+  const result = await request(f.url + '/stream', { body: '{"stream":true}' });
+  assert.deepEqual(result.body.subarray(0, 3), bom);
+  assert.match(result.body.subarray(3).toString(), /^\n\n/);
+  assert.ok(result.times.length >= 3);
+});
+
+test('JSON with a non-UTF-8 charset stays opaque instead of receiving ASCII heartbeats', async t => {
+  const raw = Buffer.from('{"ok":true}', 'utf16le');
+  const f = await fixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json; charset="utf-16le"', 'content-length': raw.length });
+    res.flushHeaders();
+    await delay(100);
+    res.end(raw);
+  });
+  const result = await request(f.url + '/api');
+  assert.deepEqual(result.body, raw);
+  assert.equal(Number(result.headers['content-length']), raw.length);
+});
+
+test('oversized Content-Length is rejected before the client uploads its body', async t => {
+  let hits = 0;
+  const f = await fixture(t, (_req, res) => { hits++; res.end(); }, { maxRequestBytes: 8 });
+  const result = await new Promise((resolve, reject) => {
+    const outgoing = http.request(f.url + '/api', { method: 'POST', headers: { 'content-length': '1000' } }, async res => {
+      try { resolve({ status: res.statusCode, headers: res.headers, body: await collect(res) }); } catch (error) { reject(error); }
+    });
+    outgoing.on('error', reject);
+    const deadline = setTimeout(() => outgoing.destroy(new Error('Oversized upload was not rejected from its headers')), 500);
+    t.after(() => { clearTimeout(deadline); outgoing.destroy(); });
+    outgoing.flushHeaders();
+  });
+  assert.equal(result.status, 413);
+  assert.equal(result.headers.connection, 'close');
+  assert.equal(JSON.parse(result.body).error.code, 'request_too_large');
+  assert.equal(hits, 0);
+});
+
+test('configuration rejects integer limits outside the safe numeric range', () => {
+  for (const name of ['MAX_REQUEST_BYTES', 'MAX_JSON_RESPONSE_BYTES', 'MAX_BUFFERED_REQUEST_BYTES', 'MAX_BUFFERED_RESPONSE_BYTES', 'MAX_SSE_EVENT_BYTES', 'MAX_BUFFERED_SSE_BYTES']) {
+    assert.throws(() => loadConfig({ TARGET_URL: 'http://localhost', [name]: '9007199254740992' }), new RegExp(name));
+  }
+});
+
+test('concurrent JSON responses share a disk budget and release it after cleanup', async t => {
+  let entered;
+  const firstChunk = new Promise(resolve => { entered = resolve; });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const raw = '{"ok":true}';
+  const f = await fixture(t, async (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (req.url === '/first') {
+      res.write(raw);
+      entered();
+      await gate;
+      res.end();
+    } else res.end(raw);
+  }, { maxBufferedResponseBytes: 16, adminToken: 'admin-secret' });
+  const first = request(f.url + '/first');
+  await firstChunk;
+  await waitFor(async () => {
+    const data = JSON.parse((await request(f.url + '/__proxy/status', {
+      method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+    })).body);
+    return data.resources.buffered_response_bytes === Buffer.byteLength(raw);
+  });
+  const refused = await request(f.url + '/second');
+  assert.equal(JSON.parse(refused.body).error.code, 'response_storage_limit');
+  assert.equal(JSON.parse(refused.body).error.status, 503);
+  release();
+  assert.equal(JSON.parse((await first).body).ok, true);
+  await delay(30);
+  assert.equal(JSON.parse((await request(f.url + '/third')).body).ok, true);
+  await delay(30);
+  assert.deepEqual(await readdir(f.directory), []);
+});
+
+test('cancelling a buffered JSON response releases its disk budget and admission slot', async t => {
+  const f = await fixture(t, (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"ok":true}');
+    if (req.url !== '/cancel') res.end();
+  }, { maxBufferedResponseBytes: 16, maxConcurrentRequests: 1, adminToken: 'admin-secret' });
+  const status = async () => JSON.parse((await request(f.url + '/__proxy/status', {
+    method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+  })).body);
+  let cancel;
+  const began = new Promise((resolve, reject) => {
+    cancel = http.get(f.url + '/cancel', res => {
+      res.on('error', () => {});
+      res.once('data', resolve);
+      res.resume();
+    });
+    cancel.on('error', reject);
+  });
+  t.after(() => cancel.destroy());
+  await began;
+  await waitFor(async () => (await status()).resources.buffered_response_bytes === 11);
+  cancel.destroy();
+  const resources = await waitFor(async () => {
+    const data = (await status()).resources;
+    return data.active_requests === 0 && data;
+  });
+  assert.equal(resources.active_requests, 0);
+  assert.equal(resources.buffered_request_bytes, 0);
+  assert.equal(resources.buffered_response_bytes, 0);
+  assert.equal(JSON.parse((await request(f.url + '/next')).body).ok, true);
+});
+
+test('opaque response diagnostics count bytes without changing the response', async t => {
+  const raw = Buffer.from([0, 255, 1, 2, 3, 10]);
+  const f = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': raw.length });
+    res.end(raw);
+  }, { adminToken: 'admin-secret' });
+  const result = await request(f.url + '/download');
+  assert.deepEqual(result.body, raw);
+  const status = JSON.parse((await request(f.url + '/__proxy/status', {
+    method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+  })).body);
+  const finished = status.events.find(event => event.event === 'request_finished');
+  assert.equal(finished.upstream_body_bytes, raw.length);
+});
+
+test('a truncated BOM prefix in SSE reports an error and explicit bypass still preserves bytes', async t => {
+  const raw = Buffer.from([0xef, 0xbb]);
+  const f = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(raw);
+  }, { firstHeartbeatMs: 500 });
+  const result = await request(f.url + '/stream', { body: '{"stream":true}' });
+  assert.match(result.body.toString(), /incomplete_sse_event/);
+  const bypassed = await request(f.url + '/stream', { body: '{"stream":true}', headers: { 'x-proxy-heartbeat': 'off' } });
+  assert.deepEqual(bypassed.body, raw);
+});
+
+test('unsupported upgrades and CONNECT cannot keep rejected sockets open indefinitely', async t => {
+  for (const upgrade of [true, false]) {
+    await t.test(upgrade ? 'Upgrade' : 'CONNECT', async sub => {
+      let socket;
+      sub.after(() => socket?.destroy());
+      const f = await fixture(sub, (_req, res) => res.end('target'));
+      const data = await new Promise((resolve, reject) => {
+        socket = net.connect({ host: '127.0.0.1', port: f.server.address().port, allowHalfOpen: true });
+        const chunks = [];
+        socket.on('data', chunk => chunks.push(chunk));
+        socket.on('error', reject);
+        socket.once('end', () => resolve(Buffer.concat(chunks).toString()));
+        socket.once('connect', () => socket.write(upgrade
+          ? 'GET /socket HTTP/1.1\r\nHost: relay.local\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'
+          : 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'));
+      });
+      assert.match(data, upgrade ? /^HTTP\/1.1 426 / : /^HTTP\/1.1 405 /);
+      assert.equal(socket.writableEnded, false, 'The peer deliberately has not closed its sending side');
+      let count;
+      for (let i = 0; i < 50; i++) {
+        count = await new Promise((resolve, reject) => f.server.getConnections((error, value) => error ? reject(error) : resolve(value)));
+        if (count === 0) break;
+        await delay(10);
+      }
+      assert.equal(count, 0, 'Rejected sockets must close without waiting for the peer to send FIN');
+    });
+  }
+});
+
+test('heartbeats continue through a long pause inside an upstream SSE data field', async t => {
+  const f = await fixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"text":"first');
+    await delay(450);
+    res.end(' second"}\n\ndata: [DONE]\n\n');
+  }, { firstHeartbeatMs: 10, heartbeatMs: 20 });
+  const result = await request(f.url + '/stream', { body: '{"stream":true}' });
+  assert.ok(result.times.length >= 5);
+  const gaps = result.times.slice(1).map((time, index) => time - result.times[index]);
+  assert.ok(Math.max(...gaps) < 200, `Lost heartbeats during partial event: ${Math.max(...gaps)}ms`);
+  assert.equal(result.body.toString().trimStart(), 'data: {"text":"first second"}\n\ndata: [DONE]\n\n');
+});
+
+test('clean EOF and TCP reset during a partial SSE event produce parseable errors', async t => {
+  for (const reset of [false, true]) {
+    await t.test(reset ? 'reset' : 'clean EOF', async sub => {
+      let hits = 0;
+      const f = await fixture(sub, async (_req, res) => {
+        hits++;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write('data: {"incomplete":');
+        await delay(70);
+        if (reset) res.destroy(); else res.end();
+      });
+      const result = await request(f.url + '/stream', { body: '{"stream":true}' });
+      assert.ok(!result.body.toString().includes('"incomplete"'));
+      const frame = result.body.toString().trimStart();
+      assert.match(frame, /^event: error\ndata: /);
+      const error = JSON.parse(frame.split('\n')[1].slice(6)).error;
+      assert.equal(error.code, reset ? 'upstream_connection_error' : 'incomplete_sse_event');
+      assert.equal(hits, 1, 'A failed AI request must never be replayed automatically');
+    });
+  }
+});
+
+test('oversized SSE events fail at a safe boundary and release their memory', async t => {
+  const f = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: ' + 'x'.repeat(100) + '\n\n');
+  }, { maxSseEventBytes: 32, adminToken: 'admin-secret' });
+  const result = await request(f.url + '/stream', { body: '{"stream":true}' });
+  assert.match(result.body.toString().trimStart(), /^event: error\ndata: /);
+  assert.match(result.body.toString(), /sse_event_too_large/);
+  const status = JSON.parse((await request(f.url + '/__proxy/status', {
+    method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+  })).body);
+  assert.equal(status.resources.buffered_sse_bytes, 0);
+});
+
+test('SSE buffers share a budget, and cancellation frees capacity for another stream', async t => {
+  let cancel;
+  t.after(() => cancel?.destroy());
+  const f = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: 1234567890');
+  }, { maxBufferedSseBytes: 25, adminToken: 'admin-secret' });
+  const stats = async () => JSON.parse((await request(f.url + '/__proxy/status', {
+    method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+  })).body).resources;
+  await new Promise((resolve, reject) => {
+    cancel = http.get(f.url + '/stream', res => { res.on('error', () => {}); res.resume(); resolve(); });
+    cancel.on('error', reject);
+  });
+  await waitFor(async () => (await stats()).buffered_sse_bytes === 16);
+  const rejected = await request(f.url + '/stream', { body: '{"stream":true}' });
+  assert.match(rejected.body.toString(), /sse_memory_limit/);
+  assert.equal((await stats()).buffered_sse_bytes, 16);
+  cancel.destroy();
+  await waitFor(async () => (await stats()).active_requests === 0);
+  assert.equal((await stats()).buffered_sse_bytes, 0);
+});
+
+test('idle upstream sockets expire while active slow requests outlive the pool timeout', async t => {
+  const sockets = [];
+  const f = await fixture(t, async (req, res) => {
+    sockets.push(req.socket);
+    if (req.url === '/slow') await delay(650);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  }, { upstreamIdleSocketMs: 500 });
+  await request(f.url + '/warmup');
+  const slow = await request(f.url + '/slow');
+  assert.equal(JSON.parse(slow.body).ok, true);
+  assert.equal(sockets[0], sockets[1], 'The active request should use the still-fresh pooled socket');
+  await waitFor(() => sockets[1].destroyed);
+  await request(f.url + '/fresh');
+  assert.notEqual(sockets[1], sockets[2]);
+});
+
+test('a client that stops draining a response cannot retain its upstream and relay slot', async t => {
+  let client;
+  t.after(() => client?.destroy());
+  const f = await fixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    const chunk = Buffer.alloc(64 * 1024);
+    await pipeline(Readable.from((function* () { for (let i = 0; i < 2048; i++) yield chunk; })()), res);
+  }, { downstreamStallMs: 80, adminToken: 'admin-secret', totalTimeoutMs: 0 });
+  await new Promise((resolve, reject) => {
+    client = http.get(f.url + '/large', { headers: { 'x-proxy-heartbeat': 'off' } }, res => { res.on('error', () => {}); res.pause(); resolve(); });
+    client.on('error', reject);
+  });
+  let lastStatus;
+  const final = await waitFor(async () => {
+    const status = JSON.parse((await request(f.url + '/__proxy/status', {
+      method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+    })).body);
+    lastStatus = status;
+    return status.events.some(event => event.code === 'downstream_stalled') && status.resources.active_requests === 0 && status;
+  }).catch(error => {
+    throw new Error(`${error.message}; resources=${JSON.stringify(lastStatus?.resources)}; events=${JSON.stringify(lastStatus?.events.map(event => ({ event: event.event, code: event.code, phase: event.phase, outcome: event.outcome, bytes: event.upstream_body_bytes })))}`, { cause: error });
+  });
+  assert.equal(final.resources.buffered_request_bytes, 0);
+  assert.equal(final.resources.buffered_sse_bytes, 0);
+});
+
+test('draining marks readiness unhealthy and rejects new forwarding without touching the target', async t => {
+  let hits = 0;
+  const f = await fixture(t, (_req, res) => { hits++; res.end('target'); });
+  f.relay.beginShutdown();
+  const health = await request(f.url + '/__proxy_health', { method: 'GET', body: null });
+  assert.equal(health.status, 503);
+  assert.equal(JSON.parse(health.body).ok, false);
+  const rejected = await request(f.url + '/api');
+  assert.equal(rejected.status, 503);
+  assert.equal(JSON.parse(rejected.body).error.code, 'server_shutting_down');
+  assert.equal(hits, 0);
+  await f.relay.whenIdle();
+});
+
+test('forced draining finishes diagnostic probes with JSON instead of silently disconnecting', async t => {
+  const f = await fixture(t, (_req, res) => res.end(), { adminToken: 'admin-secret' });
+  let first;
+  const started = new Promise(resolve => { first = resolve; });
+  const pending = request(f.url + '/__proxy/probe?seconds=10', {
+    method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' }, onChunk: first,
+  });
+  await started;
+  f.relay.abortRequests();
+  assert.equal(JSON.parse((await pending).body).error.code, 'server_shutting_down');
+  const rejected = await request(f.url + '/__proxy/probe?seconds=1', {
+    method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+  });
+  assert.equal(rejected.status, 503);
+});
+
+test('upstream resets remain upstream failures in diagnostics and never replay an AI request', async t => {
+  for (const binary of [false, true]) {
+    await t.test(binary ? 'opaque response' : 'buffered JSON', async sub => {
+      let hits = 0;
+      const f = await fixture(sub, async (_req, res) => {
+        hits++;
+        res.writeHead(200, { 'content-type': binary ? 'application/octet-stream' : 'application/json' });
+        res.write(binary ? 'partial bytes' : '{"unfinished":');
+        await delay(70);
+        res.destroy();
+      }, { adminToken: 'admin-secret' });
+      if (binary) await assert.rejects(request(f.url + '/api'), /aborted|reset|closed/i);
+      else assert.equal(JSON.parse((await request(f.url + '/api')).body).error.code, 'upstream_connection_error');
+      const status = await waitFor(async () => {
+        const data = JSON.parse((await request(f.url + '/__proxy/status', {
+          method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' },
+        })).body);
+        return data.resources.active_requests === 0 && data;
+      });
+      assert.equal(hits, 1);
+      assert.equal(status.events.find(event => event.event === 'request_finished').outcome, 'relay_error');
+      assert.ok(status.events.some(event => ['ECONNRESET', 'ERR_STREAM_PREMATURE_CLOSE'].includes(event.code)));
+      assert.deepEqual(await readdir(f.directory), []);
+    });
+  }
+});
+
+test('the public keepalive endpoint is lightweight, method-limited and independent of proxy authentication', async t => {
+  let hits = 0;
+  const f = await fixture(t, (_req, res) => { hits++; res.end('target'); }, { proxyToken: 'proxy-secret' });
+  for (const method of ['GET', 'HEAD']) {
+    const response = await request(f.url + '/keepalive?ignored=1', { method, body: null });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.length, 0);
+    assert.equal(response.headers['cache-control'], 'no-store');
+  }
+  const rejected = await request(f.url + '/keepalive');
+  assert.equal(rejected.status, 405);
+  assert.equal(rejected.headers.allow, 'GET, HEAD');
+  assert.equal(hits, 0);
+  f.relay.beginShutdown();
+  assert.equal((await request(f.url + '/keepalive', { method: 'GET', body: null })).status, 503);
+});
+
+test('keepalive settings require ADMIN_TOKEN and apply immediately without calling the AI target', async t => {
+  let hits = 0;
+  const f = await fixture(t, (_req, res) => { hits++; res.end('target'); }, { adminToken: 'admin-secret', proxyToken: 'proxy-secret' });
+  const path = f.url + '/__proxy/keepalive';
+  const admin = { 'x-admin-token': 'admin-secret' };
+  const settings = { url: f.url + '/keepalive', interval_seconds: 5 };
+  assert.equal((await request(path, { method: 'GET', body: null })).status, 401);
+  assert.equal((await request(path + '?token=admin-secret', { method: 'GET', body: null })).status, 401);
+  assert.equal((await request(path, { method: 'PUT', body: JSON.stringify(settings) })).status, 401);
+  const saved = await request(path, { method: 'PUT', headers: admin, body: JSON.stringify(settings) });
+  assert.equal(saved.status, 200);
+  assert.equal(JSON.parse(saved.body).url, settings.url);
+  const status = async () => JSON.parse((await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: admin })).body);
+  await waitFor(async () => (await status()).keepalive.last_ok === true);
+  const data = await status();
+  assert.equal(data.total_requests, 0);
+  assert.equal(data.keepalive.last_status, 200);
+  assert.equal(data.keepalive.url, undefined);
+  assert.equal(hits, 0);
+  const stopped = await request(path, { method: 'PUT', headers: admin, body: JSON.stringify({ url: '', interval_seconds: 5 }) });
+  assert.equal(JSON.parse(stopped.body).status.running, false);
+  f.relay.beginShutdown();
+  assert.equal((await request(path, { method: 'PUT', headers: admin, body: JSON.stringify(settings) })).status, 503);
+});
+
+test('keepalive environment locks prevent changes and public status does not expose configured query secrets', async t => {
+  const configured = 'http://127.0.0.1:1/health?token=keepalive-private-value';
+  const f = await fixture(t, (_req, res) => res.end('target'), {
+    adminToken: 'admin-secret', keepaliveUrl: configured, keepaliveEnvLocks: { url: true, interval: true },
+  });
+  const admin = { 'x-admin-token': 'admin-secret' };
+  const response = await request(f.url + '/__proxy/keepalive', { method: 'GET', body: null, headers: admin });
+  assert.equal(JSON.parse(response.body).url, configured);
+  assert.equal(JSON.parse(response.body).locked.url, true);
+  const changed = await request(f.url + '/__proxy/keepalive', {
+    method: 'PUT', headers: admin, body: JSON.stringify({ url: '', interval_seconds: 60 }),
+  });
+  assert.equal(changed.status, 409);
+  const status = await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: admin });
+  assert.ok(!status.body.toString().includes('keepalive-private-value'));
+  assert.equal((await request(f.url + '/__proxy/keepalive', { method: 'HEAD', body: null, headers: admin })).body.length, 0);
+});
+
+test('invalid and oversized keepalive settings are rejected without starting a background request', async t => {
+  const f = await fixture(t, (_req, res) => res.end('target'), { adminToken: 'admin-secret' });
+  const admin = { 'x-admin-token': 'admin-secret' };
+  const path = f.url + '/__proxy/keepalive';
+  for (const body of ['{broken', '[]', '{"url":"file:///etc/passwd","interval_seconds":60}', '{"url":"","interval_seconds":1}', '{"url":"","interval_seconds":60,"extra":true}']) {
+    assert.equal((await request(path, { method: 'PUT', headers: admin, body })).status, 400);
+  }
+  assert.equal((await request(path, { method: 'PUT', headers: { ...admin, 'content-type': 'text/plain' }, body: '{}' })).status, 415);
+  assert.equal((await request(path, { method: 'PUT', headers: admin, body: 'x'.repeat(9000) })).status, 413);
+  assert.equal((await request(path, { method: 'DELETE', headers: admin, body: null })).status, 405);
+  const current = JSON.parse((await request(path, { method: 'GET', headers: admin, body: null })).body);
+  assert.equal(current.status.configured, false);
+  assert.equal(current.status.attempts, 0);
 });
