@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
-import { Readable } from 'node:stream';
+import { Readable, PassThrough, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { once } from 'node:events';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
@@ -400,9 +400,13 @@ test('configuration rejects unsupported targets and invalid timeout values', () 
   }
   assert.throws(() => loadConfig({ TARGET_URL: 'https://host', HEARTBEAT_INTERVAL_SECONDS: '125' }));
   assert.throws(() => loadConfig({ TARGET_URL: 'https://host', PORT: '-1' }));
-  for (const [name, value] of Object.entries({ TCP_KEEPALIVE_SECONDS: '0', UPSTREAM_IDLE_SOCKET_TIMEOUT_SECONDS: '0', DOWNSTREAM_STALL_TIMEOUT_SECONDS: '-1', SHUTDOWN_GRACE_SECONDS: '301', MAX_SSE_EVENT_BYTES: '0', MAX_BUFFERED_SSE_BYTES: '0' })) {
+  for (const [name, value] of Object.entries({ TCP_KEEPALIVE_SECONDS: '0', UPSTREAM_IDLE_SOCKET_TIMEOUT_SECONDS: '0', DOWNSTREAM_STALL_TIMEOUT_SECONDS: '-1', SHUTDOWN_GRACE_SECONDS: '301', MAX_SSE_EVENT_BYTES: '0', MAX_BUFFERED_SSE_BYTES: '0', ADMIN_REQUEST_TIMEOUT_SECONDS: '121', MAX_JSON_DEPTH: '16385' })) {
     assert.throws(() => loadConfig({ TARGET_URL: 'https://host', [name]: value }), new RegExp(name));
   }
+  for (const name of ['ADMIN_REQUEST_TIMEOUT_SECONDS', 'MAX_JSON_DEPTH']) {
+    assert.throws(() => loadConfig({ TARGET_URL: 'https://host', [name]: '0' }), new RegExp(name));
+  }
+  assert.throws(() => loadConfig({ TARGET_URL: 'https://host', MAX_JSON_DEPTH: '1.5' }), /MAX_JSON_DEPTH/);
 });
 
 test('defaults use one-second heartbeats and bounded request resources', () => {
@@ -418,6 +422,8 @@ test('defaults use one-second heartbeats and bounded request resources', () => {
   assert.equal(config.shutdownGraceMs, 25000);
   assert.equal(config.maxSseEventBytes, 16 * 1024 * 1024);
   assert.equal(config.maxBufferedSseBytes, 64 * 1024 * 1024);
+  assert.equal(config.maxJsonDepth, 1024);
+  assert.equal(config.adminRequestTimeoutMs, 15000);
   assert.throws(() => loadConfig({ TARGET_URL: 'https://host', MAX_CONCURRENT_REQUESTS: '0' }));
 });
 
@@ -1247,4 +1253,191 @@ test('invalid and oversized keepalive settings are rejected without starting a b
   const current = JSON.parse((await request(path, { method: 'GET', headers: admin, body: null })).body);
   assert.equal(current.status.configured, false);
   assert.equal(current.status.attempts, 0);
+});
+
+test('whitespace-only numeric environment variables retain their documented defaults', () => {
+  const config = loadConfig({ TARGET_URL: 'https://example.com', PORT: ' ', UPSTREAM_TIMEOUT_SECONDS: '  ', HEARTBEAT_INTERVAL_SECONDS: '\t', MAX_REQUEST_BYTES: ' ' });
+  assert.equal(config.port, 10000);
+  assert.equal(config.totalTimeoutMs, 1800000);
+  assert.equal(config.heartbeatMs, 1000);
+  assert.equal(config.maxRequestBytes, 33554432);
+});
+
+test('incomplete or invalid JSON cannot be returned as a completed upstream result', async t => {
+  for (const raw of ['{"private_result":"unfinished', '{"items":[1,2', '{"ok":true}unexpected', '{"wrong":01}']) {
+    await t.test(raw, async sub => {
+      const f = await fixture(sub, (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write(raw);
+        res.end();
+      }, { firstHeartbeatMs: 500 });
+      const result = await request(f.url + '/api');
+      assert.equal(result.status, 502);
+      assert.equal(JSON.parse(result.body).error.code, 'invalid_upstream_json');
+      assert.ok(!result.body.toString().includes('private_result'));
+      await waitFor(async () => (await readdir(f.directory)).length === 0);
+    });
+  }
+});
+
+test('shutdown cancellation includes an unfinished authenticated settings upload', async t => {
+  let upload;
+  t.after(() => upload?.destroy());
+  const f = await fixture(t, (_req, res) => res.end(), { adminToken: 'admin-secret' });
+  const pending = new Promise((resolve, reject) => {
+    upload = http.request(f.url + '/__proxy/keepalive', { method: 'PUT', headers: { 'x-admin-token': 'admin-secret', 'content-type': 'application/json' } }, async res => {
+      try { resolve({ status: res.statusCode, body: await collect(res) }); } catch (error) { reject(error); }
+    });
+    upload.on('error', reject);
+    upload.write('{"url":');
+  });
+  await delay(40);
+  f.relay.beginShutdown();
+  f.relay.abortRequests();
+  const result = await Promise.race([pending, delay(500).then(() => { throw new Error('Settings upload was not cancelled during shutdown'); })]);
+  assert.equal(result.status, 503);
+  assert.equal(JSON.parse(result.body).code, 'server_shutting_down');
+});
+
+test('stale conditional settings writes cannot replace a newer administrator update', async t => {
+  const f = await fixture(t, (_req, res) => res.end(), { adminToken: 'admin-secret' });
+  const headers = { 'x-admin-token': 'admin-secret' };
+  const path = f.url + '/__proxy/keepalive';
+  const initial = await request(path, { method: 'GET', body: null, headers });
+  const expected_revision = JSON.parse(initial.body).revision;
+  const first = await request(path, { method: 'PUT', headers, body: JSON.stringify({ url: '', interval_seconds: 90, expected_revision }) });
+  assert.equal(first.status, 200);
+  const second = await request(path, { method: 'PUT', headers, body: JSON.stringify({ url: '', interval_seconds: 120, expected_revision }) });
+  assert.equal(second.status, 412);
+  const current = await request(path, { method: 'GET', body: null, headers });
+  assert.equal(JSON.parse(current.body).interval_seconds, 90);
+});
+
+test('SSE admission and cancellation remain active until the response actually finishes', async t => {
+  let response;
+  t.after(() => response?.destroy());
+  const f = await fixture(t, (_req, res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: [DONE]\n\n'); }, { maxConcurrentRequests: 1, adminToken: 'admin-secret' });
+  let ending;
+  const finalizing = new Promise(resolve => { ending = resolve; });
+  class DelayedResponse extends Writable {
+    constructor() { super(); this.headersSent = false; this.statusCode = 200; }
+    setHeader() { return this; }
+    writeHead(status) { this.statusCode = status; this.headersSent = true; return this; }
+    flushHeaders() {}
+    _write(_chunk, _encoding, callback) { callback(); }
+    _final(callback) { this.finishResponse = callback; ending(); }
+  }
+  response = new DelayedResponse();
+  const incoming = new PassThrough();
+  Object.assign(incoming, { url: '/stream', method: 'POST', headers: { 'content-type': 'application/json' }, complete: true });
+  f.server.emit('request', incoming, response);
+  incoming.end('{"stream":true}');
+  await finalizing;
+  try {
+    const status = JSON.parse((await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' } })).body);
+    assert.equal(status.resources.active_requests, 1);
+    assert.equal(status.active.length, 1);
+    assert.equal(response.writableFinished, false);
+  } finally { response.finishResponse(); }
+});
+
+test('late malformed JSON becomes a parseable error after previously emitted heartbeats', async t => {
+  const f = await fixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"answer":"partial');
+    await delay(110);
+    res.end();
+  });
+  const result = await request(f.url + '/api');
+  assert.equal(result.status, 200);
+  assert.match(result.body.toString(), /^\n\n/);
+  assert.equal(JSON.parse(result.body).error.code, 'invalid_upstream_json');
+  await waitFor(async () => (await readdir(f.directory)).length === 0);
+});
+
+test('JSON response nesting and UTF-8 are validated while explicit bypass stays opaque', async t => {
+  const raw = Buffer.from('{"a":[[1]]}');
+  const f = await fixture(t, (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(req.url === '/utf8' ? Buffer.from([34, 0xff, 34]) : raw);
+  }, { maxJsonDepth: 2, firstHeartbeatMs: 500 });
+  assert.equal(JSON.parse((await request(f.url + '/deep')).body).error.code, 'json_nesting_limit');
+  assert.equal(JSON.parse((await request(f.url + '/utf8')).body).error.code, 'invalid_upstream_json');
+  const bypassed = await request(f.url + '/deep', { headers: { 'x-proxy-heartbeat': 'off' } });
+  assert.deepEqual(bypassed.body, raw);
+});
+
+test('settings upload deadlines release their admission slot and close incomplete connections', async t => {
+  let upload;
+  t.after(() => upload?.destroy());
+  const f = await fixture(t, (_req, res) => res.end(), { adminToken: 'admin-secret', adminRequestTimeoutMs: 70 });
+  const result = await new Promise((resolve, reject) => {
+    upload = http.request(f.url + '/__proxy/keepalive', { method: 'PUT', headers: { 'x-admin-token': 'admin-secret', 'content-type': 'application/json' } }, async res => {
+      try { resolve({ status: res.statusCode, headers: res.headers, body: await collect(res) }); } catch (error) { reject(error); }
+    });
+    upload.on('error', reject);
+    upload.write('{');
+  });
+  assert.equal(result.status, 408);
+  assert.equal(JSON.parse(result.body).code, 'admin_request_timeout');
+  assert.equal(result.headers.connection, 'close');
+  const status = JSON.parse((await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: { 'x-admin-token': 'admin-secret' } })).body);
+  assert.equal(status.diagnostics.active_settings_updates, 0);
+});
+
+test('settings uploads have an independent concurrency limit and cancel without holding idle waiters', async t => {
+  const uploads = [];
+  t.after(() => uploads.forEach(upload => upload.destroy()));
+  const f = await fixture(t, (_req, res) => res.end(), { adminToken: 'admin-secret' });
+  const admin = { 'x-admin-token': 'admin-secret' };
+  for (let i = 0; i < 2; i++) {
+    const upload = http.request(f.url + '/__proxy/keepalive', { method: 'PUT', headers: { ...admin, 'content-type': 'application/json' } });
+    upload.on('error', () => {});
+    upload.write('{');
+    uploads.push(upload);
+  }
+  const status = async () => JSON.parse((await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: admin })).body);
+  await waitFor(async () => (await status()).diagnostics.active_settings_updates === 2);
+  const busy = await request(f.url + '/__proxy/keepalive', { method: 'PUT', headers: admin, body: '{"url":"","interval_seconds":60}' });
+  assert.equal(busy.status, 429);
+  assert.equal(busy.headers['retry-after'], '1');
+  let idle = false;
+  const settled = f.relay.whenIdle().then(() => { idle = true; });
+  await delay(10);
+  assert.equal(idle, false);
+  uploads.forEach(upload => upload.destroy());
+  await settled;
+  assert.equal((await status()).diagnostics.active_settings_updates, 0);
+  assert.equal((await request(f.url + '/__proxy/keepalive', { method: 'PUT', headers: admin, body: '{"url":"","interval_seconds":60}' })).status, 200);
+});
+
+test('SSE final write queues are destroyed on a stall or shutdown cancellation', async t => {
+  for (const mode of ['stall', 'shutdown']) {
+    await t.test(mode, async sub => {
+      let response;
+      sub.after(() => response?.destroy());
+      const f = await fixture(sub, (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end('data: [DONE]\n\n');
+      }, { downstreamStallMs: mode === 'stall' ? 50 : 0 });
+      class StalledResponse extends Writable {
+        constructor() { super(); this.headersSent = false; this.statusCode = 200; }
+        setHeader() { return this; }
+        writeHead(status) { this.statusCode = status; this.headersSent = true; return this; }
+        flushHeaders() {}
+        _write() { /* Keep a small final write queued, below highWaterMark. */ }
+      }
+      response = new StalledResponse();
+      const incoming = new PassThrough();
+      Object.assign(incoming, { url: '/stream', method: 'POST', headers: { 'content-type': 'application/json' }, complete: true });
+      f.server.emit('request', incoming, response);
+      incoming.end('{"stream":true}');
+      await waitFor(() => response.writableEnded);
+      assert.equal(response.writableNeedDrain, false);
+      assert.ok(response.writableLength > 0);
+      if (mode === 'shutdown') f.relay.abortRequests();
+      await f.relay.whenIdle();
+      assert.equal(response.destroyed, true);
+    });
+  }
 });

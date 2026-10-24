@@ -174,3 +174,43 @@ test('non-empty environment variables lock their settings while invalid updates 
   assert.throws(() => f.keepalive.update({ url: 'file:///etc/passwd', interval_seconds: 60 }), { code: 'invalid_keepalive_url' });
   assert.equal(f.keepalive.settings().url, 'https://example.com/keepalive');
 });
+
+test('saving unchanged keepalive settings preserves the schedule and existing statistics', async t => {
+  let hits = 0;
+  const url = await origin(t, (req, res) => { hits++; req.resume(); res.end(); });
+  const f = service(t, url, { keepaliveIntervalMs: 5000 });
+  f.keepalive.start();
+  await waitFor(() => f.keepalive.status().last_ok === true);
+  const before = f.keepalive.status();
+  f.keepalive.update({ url, interval_seconds: 5 });
+  assert.equal(f.keepalive.status().attempts, before.attempts);
+  assert.equal(f.keepalive.status().last_attempt_at, before.last_attempt_at);
+  await delay(80);
+  assert.equal(hits, 1, 'Saving the same configuration must not trigger another immediate GET');
+});
+
+test('configuration revisions survive no-op saves and differ across changes and process instances', t => {
+  const f = service(t, '');
+  const initial = f.keepalive.settings().revision;
+  f.keepalive.update({ url: '', interval_seconds: 5 });
+  const revision = f.keepalive.settings().revision;
+  assert.notEqual(initial, revision);
+  assert.equal(f.keepalive.update({ url: '', interval_seconds: 5, expected_revision: revision }).revision, revision);
+  assert.throws(() => f.keepalive.update({ url: '', interval_seconds: 10, expected_revision: initial }), { status: 412 });
+  assert.throws(() => f.keepalive.update({ url: '', interval_seconds: 10, expected_revision: null }), { status: 400 });
+  assert.notEqual(service(t, '').keepalive.settings().revision, initial);
+});
+
+test('a protocol upgrade is closed and classified immediately instead of waiting for a timeout', async t => {
+  const url = await origin(t, (req, res) => {
+    req.resume();
+    res.writeHead(101, { connection: 'Upgrade', upgrade: 'websocket' });
+    res.end();
+  });
+  const f = service(t, url);
+  f.keepalive.start();
+  await waitFor(() => f.keepalive.status().last_error_code !== null);
+  f.keepalive.stop();
+  assert.equal(f.keepalive.status().last_error_code, 'keepalive_unsupported_upgrade');
+  assert.equal(f.keepalive.status().last_status, 101);
+});

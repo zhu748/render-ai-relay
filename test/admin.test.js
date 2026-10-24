@@ -209,3 +209,29 @@ test('disconnect clears configured URLs and cancels a pending settings save', as
   assert.equal(p.get('keepalive-url').value, '');
   assert.equal(p.get('keepalive-save').disabled, true);
 });
+
+test('conditional admin saves preserve unsaved edits on conflict and offer an explicit reload', async () => {
+  const stored = { url: '', interval_seconds: 60, revision: 'initial-revision', locked: { url: false, interval: false }, status: { configured: false, running: false, interval_seconds: 60, attempts: 0 } };
+  const p = page({ keepalive: stored });
+  p.get('token').value = 'secret';
+  p.get('connect').click();
+  p.calls[0].json(emptyStatus);
+  await flush();
+  p.get('keepalive-interval').value = '90';
+  p.get('keepalive-save').click();
+  const save = p.calls.at(-1);
+  assert.equal(JSON.parse(save.options.body).expected_revision, 'initial-revision');
+  save.json({ error: 'Settings changed' }, 412);
+  await flush();
+  assert.equal(p.get('keepalive-interval').value, '90');
+  assert.match(p.get('keepalive-config-status').textContent, /重新读取配置/);
+  stored.interval_seconds = 120;
+  stored.revision = 'new-revision';
+  p.get('keepalive-reload').click();
+  await flush();
+  assert.equal(p.get('keepalive-interval').value, '120');
+  p.get('keepalive-save').click();
+  assert.equal(JSON.parse(p.calls.at(-1).options.body).expected_revision, 'new-revision');
+  p.get('disconnect').click();
+  await flush();
+});

@@ -116,6 +116,7 @@ function keepaliveControls() {
   $('keepalive-url').readOnly = Boolean(keepaliveSettings?.locked.url);
   $('keepalive-interval').readOnly = Boolean(keepaliveSettings?.locked.interval);
   $('keepalive-current').disabled = !ready || Boolean(keepaliveSettings?.locked.url);
+  $('keepalive-reload').disabled = !connected || Boolean(keepaliveController);
   $('keepalive-save').disabled = !ready || Boolean(keepaliveSettings?.locked.url && keepaliveSettings?.locked.interval);
 }
 
@@ -138,12 +139,12 @@ async function keepaliveRequest(current, value) {
     const response = await fetch('/__proxy/keepalive', {
       method: value ? 'PUT' : 'GET',
       headers: { 'X-Admin-Token': token, ...(value ? { 'Content-Type': 'application/json' } : {}) },
-      ...(value ? { body: JSON.stringify(value) } : {}),
+      ...(value ? { body: JSON.stringify({ ...value, ...(keepaliveSettings?.revision ? { expected_revision: keepaliveSettings.revision } : {}) }) } : {}),
       cache: 'no-store', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
     });
     const data = await response.json();
     if (current !== session) return;
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    if (!response.ok) throw new Error(response.status === 412 ? '配置已在其他会话更新，请点击“重新读取配置”后再保存。' : data.error || `HTTP ${response.status}`);
     keepaliveSettings = data;
     $('keepalive-url').value = data.url;
     $('keepalive-interval').value = String(data.interval_seconds);
@@ -162,6 +163,9 @@ async function keepaliveRequest(current, value) {
 
 $('keepalive-current').addEventListener('click', () => {
   $('keepalive-url').value = `${location.origin}/keepalive`;
+});
+$('keepalive-reload').addEventListener('click', () => {
+  if (connected && !keepaliveController) void keepaliveRequest(session);
 });
 $('keepalive-save').addEventListener('click', () => {
   if (!connected || !keepaliveSettings || keepaliveController) return;

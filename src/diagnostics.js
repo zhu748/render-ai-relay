@@ -2,6 +2,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import metadata from '../package.json' with { type: 'json' };
 import { ProxyError } from './errors.js';
+import { readBody } from './request.js';
 
 export const VERSION = metadata.version;
 const page = readFileSync(new URL('./admin.html', import.meta.url));
@@ -20,7 +21,15 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
   const started = performance.now();
   let probes = 0;
   const probeStops = new Set();
+  const settingsUploads = new Set();
+  const idleWaiters = new Set();
   let total = 0;
+
+  function resolveIdle() {
+    if (probes || settingsUploads.size) return;
+    for (const resolve of idleWaiters) resolve();
+    idleWaiters.clear();
+  }
 
   function json(res, status, data, head = false) {
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -82,14 +91,17 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
       clearTimeout(endTimer);
       probes--;
       probeStops.delete(stop);
+      resolveIdle();
     };
     const stop = () => {
       if (finished) return;
+      clearTimeout(heartbeatTimer);
+      clearTimeout(endTimer);
       if (!res.destroyed && !res.writableEnded) {
         commit();
         res.end(JSON.stringify({ error: { type: 'relay_error', code: 'server_shutting_down', message: 'Relay is shutting down', status: 503 } }));
       }
-      cleanup();
+      if (res.destroyed) cleanup();
     };
     probeStops.add(stop);
     const tick = () => {
@@ -106,12 +118,12 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
       if (res.destroyed) { cleanup(); return; }
       commit();
       res.end(JSON.stringify({ ok: true, probe: true, elapsed_ms: Math.round(performance.now() - began), heartbeats: count }));
-      cleanup();
     }, seconds * 1000);
     endTimer.unref();
     heartbeatTimer = setTimeout(tick, config.firstHeartbeatMs);
     heartbeatTimer.unref();
     res.once('close', cleanup);
+    res.once('finish', cleanup);
     res.on('error', cleanup);
   }
 
@@ -123,7 +135,12 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('referrer-policy', 'no-referrer');
     res.setHeader('x-frame-options', 'DENY');
+    const discard = () => {
+      if (!req.complete) res.setHeader('connection', 'close');
+      req.resume();
+    };
     if (!['GET', 'HEAD'].includes(req.method) && !writingKeepalive) {
+      discard();
       res.setHeader('allow', path === '/__proxy/keepalive' ? 'GET, HEAD, PUT' : 'GET, HEAD');
       json(res, 405, { error: 'Method not allowed' });
     } else if (path === '/__proxy' || path === '/__proxy/' || path === '/__proxy/admin.js') {
@@ -133,10 +150,10 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
     } else if (!['/__proxy/status', '/__proxy/probe', '/__proxy/keepalive'].includes(path)) {
       json(res, 404, { error: 'Diagnostic route not found' }, req.method === 'HEAD');
     } else if (!config.adminToken) {
-      if (writingKeepalive) req.resume();
+      if (writingKeepalive) discard();
       json(res, 503, { error: '请在 Render 的 Environment 中设置 ADMIN_TOKEN，再重新部署。管理密钥与目标站 Key 无关。' }, req.method === 'HEAD');
     } else if (!matches(req.headers['x-admin-token'], config.adminToken)) {
-      if (writingKeepalive) req.resume();
+      if (writingKeepalive) discard();
       json(res, 401, { error: '管理密钥不正确，请填写 Render 环境变量 ADMIN_TOKEN 的值。' }, req.method === 'HEAD');
     } else if (path === '/__proxy/status') {
       json(res, 200, {
@@ -149,18 +166,20 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
         total_requests: total,
         resources: resourceStats(),
         keepalive: keepalive?.status(),
+        diagnostics: { active_probes: probes, active_settings_updates: settingsUploads.size },
         active: [...active.values()].map(snapshot => snapshot()),
         events: events.slice().reverse(),
       }, req.method === 'HEAD');
     } else if (path === '/__proxy/keepalive' && !writingKeepalive) {
       json(res, 200, keepalive.settings(), req.method === 'HEAD');
     } else if (resourceStats().draining) {
-      if (writingKeepalive) req.resume();
+      if (writingKeepalive) discard();
       json(res, 503, { error: 'Relay is shutting down' }, req.method === 'HEAD');
     } else if (writingKeepalive) {
       void updateKeepalive(req, res).catch(error => {
         if (res.destroyed || res.writableEnded) return;
         if (!req.complete) res.setHeader('connection', 'close');
+        if (error.status === 429) res.setHeader('retry-after', '1');
         req.resume();
         json(res, error.status || 400, { error: error.message, code: error.code || 'invalid_keepalive_settings' });
       });
@@ -176,28 +195,40 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
     if (String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
       throw new ProxyError(415, 'json_required', 'Use Content-Type: application/json');
     }
-    const body = await new Promise((resolve, reject) => {
-      const chunks = [];
-      let bytes = 0;
-      const cleanup = () => {
-        req.off('data', data); req.off('end', end); req.off('error', fail); req.off('aborted', aborted);
-      };
-      const fail = error => { cleanup(); reject(error); };
-      const aborted = () => fail(new ProxyError(499, 'client_disconnected', 'Client disconnected'));
-      const data = chunk => {
-        bytes += chunk.length;
-        if (bytes > 8192) fail(new ProxyError(413, 'settings_too_large', 'Keepalive settings must not exceed 8192 bytes'));
-        else chunks.push(chunk);
-      };
-      const end = () => { cleanup(); resolve(Buffer.concat(chunks, bytes).toString('utf8')); };
-      req.on('data', data); req.once('end', end); req.once('error', fail); req.once('aborted', aborted);
-    });
-    if (res.destroyed || req.aborted) return;
-    if (resourceStats().draining) throw new ProxyError(503, 'server_shutting_down', 'Relay is shutting down');
-    let value;
-    try { value = JSON.parse(body); } catch { throw new ProxyError(400, 'invalid_json', 'Invalid settings JSON'); }
-    json(res, 200, keepalive.update(value));
+    if (settingsUploads.size >= 2) throw new ProxyError(429, 'settings_busy', 'At most two settings uploads may run concurrently');
+    const controller = new AbortController();
+    settingsUploads.add(controller);
+    const closed = () => {
+      if (!res.writableFinished && !controller.signal.aborted) controller.abort(new ProxyError(499, 'client_disconnected', 'Client disconnected'));
+    };
+    res.once('close', closed);
+    const timeout = setTimeout(() => controller.abort(new ProxyError(408, 'admin_request_timeout', 'Settings upload exceeded ADMIN_REQUEST_TIMEOUT_SECONDS')), config.adminRequestTimeoutMs);
+    timeout.unref();
+    try {
+      const body = await readBody(req, {
+        maxBytes: 8192, signal: controller.signal,
+        tooLargeCode: 'settings_too_large', tooLargeMessage: 'Keepalive settings must not exceed 8192 bytes',
+      });
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (res.destroyed || req.aborted) return;
+      if (resourceStats().draining) throw new ProxyError(503, 'server_shutting_down', 'Relay is shutting down');
+      let value;
+      try { value = JSON.parse(body.toString('utf8')); } catch { throw new ProxyError(400, 'invalid_json', 'Invalid settings JSON'); }
+      json(res, 200, keepalive.update(value));
+    } finally {
+      clearTimeout(timeout);
+      res.off('close', closed);
+      settingsUploads.delete(controller);
+      resolveIdle();
+    }
   }
 
-  return { begin, handle, stopProbes() { for (const stop of probeStops) stop(); } };
+  return {
+    begin, handle,
+    abortRequests(reason) {
+      for (const stop of probeStops) stop();
+      for (const controller of settingsUploads) if (!controller.signal.aborted) controller.abort(reason);
+    },
+    whenIdle() { return probes || settingsUploads.size ? new Promise(resolve => idleWaiters.add(resolve)) : Promise.resolve(); },
+  };
 }

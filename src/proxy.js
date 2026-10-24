@@ -6,11 +6,13 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Transform } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
+import { pipeline, finished } from 'node:stream/promises';
 import { createDiagnostics, VERSION } from './diagnostics.js';
 import { ProxyError } from './errors.js';
 import { createSseBuffer } from './sse.js';
 import { createKeepalive, normalizeKeepaliveUrl } from './keepalive.js';
+import { createJsonValidator } from './json.js';
+import { readBody } from './request.js';
 
 export { ProxyError } from './errors.js';
 
@@ -24,7 +26,8 @@ const REPRESENTATION_HEADERS = [
 ];
 
 function numberSetting(env, name, fallback, { min = 0, max = Infinity, integer = false } = {}) {
-  const value = env[name] === undefined || env[name] === '' ? fallback : Number(env[name]);
+  const raw = env[name];
+  const value = raw === undefined || (typeof raw === 'string' && raw.trim() === '') ? fallback : Number(raw);
   if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isSafeInteger(value))) {
     throw new Error(`Invalid ${name}`);
   }
@@ -54,8 +57,10 @@ export function loadConfig(env = process.env) {
     keepaliveIntervalMs: numberSetting(env, 'KEEPALIVE_INTERVAL', 60, { min: 5, max: 86400, integer: true }) * 1000,
     keepaliveTimeoutMs: numberSetting(env, 'KEEPALIVE_TIMEOUT_SECONDS', 30, { min: 1, max: 300 }) * 1000,
     keepaliveEnvLocks: { url: Boolean(env.KEEPALIVE_URL?.trim()), interval: Boolean(env.KEEPALIVE_INTERVAL?.trim()) },
+    adminRequestTimeoutMs: numberSetting(env, 'ADMIN_REQUEST_TIMEOUT_SECONDS', 15, { min: 1, max: 120 }) * 1000,
     maxRequestBytes: numberSetting(env, 'MAX_REQUEST_BYTES', 32 * 1024 * 1024, { min: 1, integer: true }),
     maxJsonResponseBytes: numberSetting(env, 'MAX_JSON_RESPONSE_BYTES', 256 * 1024 * 1024, { min: 1, integer: true }),
+    maxJsonDepth: numberSetting(env, 'MAX_JSON_DEPTH', 1024, { min: 1, max: 16384, integer: true }),
     maxConcurrentRequests: numberSetting(env, 'MAX_CONCURRENT_REQUESTS', 32, { min: 1, max: 1024, integer: true }),
     maxBufferedRequestBytes: numberSetting(env, 'MAX_BUFFERED_REQUEST_BYTES', 64 * 1024 * 1024, { min: 1, integer: true }),
     maxBufferedResponseBytes: numberSetting(env, 'MAX_BUFFERED_RESPONSE_BYTES', 512 * 1024 * 1024, { min: 1, integer: true }),
@@ -127,49 +132,6 @@ function tokenMatches(actual, expected) {
   const left = Buffer.from(actual || '');
   const right = Buffer.from(expected);
   return left.length === right.length && timingSafeEqual(left, right);
-}
-
-function readBody(req, limit, signal, reserve) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    const cleanup = () => {
-      req.off('data', onData);
-      req.off('end', onEnd);
-      req.off('aborted', onAbort);
-      req.off('error', onError);
-      signal.removeEventListener('abort', onSignalAbort);
-    };
-    const onError = error => { cleanup(); chunks.length = 0; reject(error); };
-    const onAbort = () => onError(new ProxyError(499, 'client_disconnected', 'Client disconnected'));
-    const onSignalAbort = () => onError(signal.reason);
-    const onData = chunk => {
-      size += chunk.length;
-      if (size > limit) {
-        onError(new ProxyError(413, 'request_too_large', 'Request body exceeds MAX_REQUEST_BYTES'));
-        req.resume();
-        return;
-      }
-      if (!reserve(chunk.length)) {
-        onError(new ProxyError(503, 'request_memory_limit', 'Relay request memory limit reached; retry later'));
-        req.resume();
-        return;
-      }
-      chunks.push(chunk);
-    };
-    const onEnd = () => {
-      cleanup();
-      const body = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size);
-      chunks.length = 0;
-      resolve(body);
-    };
-    if (signal.aborted) { reject(signal.reason); return; }
-    signal.addEventListener('abort', onSignalAbort, { once: true });
-    req.on('data', onData);
-    req.on('end', onEnd);
-    req.on('aborted', onAbort);
-    req.on('error', onError);
-  });
 }
 
 function writeChunk(res, chunk, signal) {
@@ -367,7 +329,13 @@ export function createProxy(config, { logger = console } = {}) {
     }
 
     function sendFailure(error) {
-      if (res.destroyed || res.writableEnded || error.status === 499) return;
+      if (res.destroyed || error.status === 499) return;
+      if (res.writableEnded) {
+        // finished() cancellation stops waiting, but does not destroy a stream
+        // whose end() is still waiting for the final downstream write to flush.
+        if (!res.writableFinished) res.destroy();
+        return;
+      }
       if (error.code === 'downstream_stalled') { res.destroy(); return; }
       const payload = JSON.stringify({ error: {
         message: error.message,
@@ -413,11 +381,14 @@ export function createProxy(config, { logger = console } = {}) {
       }
       activeRequests++;
       admitted = true;
-      body = await readBody(req, config.maxRequestBytes, signal, bytes => {
-        if (bufferedRequestBytes + bytes > config.maxBufferedRequestBytes) return false;
-        bufferedRequestBytes += bytes;
-        requestMemoryBytes += bytes;
-        return true;
+      body = await readBody(req, {
+        maxBytes: config.maxRequestBytes, signal, tooLargeMessage: 'Request body exceeds MAX_REQUEST_BYTES',
+        reserve(bytes) {
+          if (bufferedRequestBytes + bytes > config.maxBufferedRequestBytes) return false;
+          bufferedRequestBytes += bytes;
+          requestMemoryBytes += bytes;
+          return true;
+        },
       });
       if (signal.aborted) throw signal.reason;
       forwarding.request_body_bytes = body.length;
@@ -442,7 +413,7 @@ export function createProxy(config, { logger = console } = {}) {
       trace.event('upstream_request');
       if (config.downstreamStallMs > 0) {
         stallTimer = setInterval(() => {
-          if (!res.writableNeedDrain) { stallBegan = 0; return; }
+          if (!res.writableNeedDrain && !res.writableLength) { stallBegan = 0; return; }
           const now = performance.now();
           if (!stallBegan) stallBegan = now;
           else if (now - stallBegan >= config.downstreamStallMs) {
@@ -518,6 +489,7 @@ export function createProxy(config, { logger = console } = {}) {
         }
         const filename = join(temporaryDirectory, 'response');
         let hasJsonContent = false;
+        const validator = createJsonValidator({ maxDepth: config.maxJsonDepth });
         const limiter = new Transform({
           transform(chunk, _encoding, callback) {
             receivedBodyBytes += chunk.length;
@@ -527,6 +499,7 @@ export function createProxy(config, { logger = console } = {}) {
             } else if (bufferedResponseBytes + chunk.length > config.maxBufferedResponseBytes) {
               callback(new ProxyError(503, 'response_storage_limit', 'Relay response storage limit reached; retry later'));
             } else {
+              try { validator.write(chunk); } catch (error) { callback(error); return; }
               bufferedResponseBytes += chunk.length;
               responseStorageBytes += chunk.length;
               callback(null, chunk);
@@ -535,6 +508,7 @@ export function createProxy(config, { logger = console } = {}) {
         });
         await pipeline(upstream, limiter, createWriteStream(filename, { flags: 'wx', mode: 0o600 }), { signal });
         if (!hasJsonContent) throw new ProxyError(502, 'empty_upstream_response', 'Upstream returned an empty or whitespace-only JSON body');
+        validator.finish();
         phase = 'sending_json';
         commit('json', Boolean(committedKind));
         actualBodyStarted = receivedBodyBytes > 0;
@@ -557,6 +531,7 @@ export function createProxy(config, { logger = console } = {}) {
         sseBuffer.finish();
         if (receivedBodyBytes === 0) throw new ProxyError(502, 'empty_upstream_response', 'Upstream returned an empty SSE body');
         res.end();
+        await finished(res, { signal, cleanup: true });
       } else {
         // Binary, compressed, no-body and explicitly bypassed responses stay opaque.
         if (eligible) { eligible = false; reason = 'upstream_format'; }
@@ -639,9 +614,14 @@ export function createProxy(config, { logger = console } = {}) {
       keepalive.stop();
       const reason = new ProxyError(503, 'server_shutting_down', 'Relay shutdown grace period expired');
       for (const controller of controllers) if (!controller.signal.aborted) controller.abort(reason);
-      diagnostics.stopProbes();
+      diagnostics.abortRequests(reason);
     },
-    whenIdle() { return controllers.size ? new Promise(resolve => idleWaiters.add(resolve)) : Promise.resolve(); },
+    async whenIdle() {
+      await Promise.all([
+        controllers.size ? new Promise(resolve => idleWaiters.add(resolve)) : Promise.resolve(),
+        diagnostics.whenIdle(),
+      ]);
+    },
     destroyAgents() { keepalive.stop(); for (const agent of Object.values(agents)) agent.destroy(); },
   };
 }

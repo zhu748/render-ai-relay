@@ -16,6 +16,8 @@ services:
         sync: false
       - key: ADMIN_TOKEN
         generateValue: true
+      - key: ADMIN_REQUEST_TIMEOUT_SECONDS
+        value: "15"
       - key: HEARTBEAT_START_DELAY_SECONDS
         value: "1"
       - key: HEARTBEAT_INTERVAL_SECONDS
@@ -40,6 +42,8 @@ services:
         value: "25"
       - key: MAX_CONCURRENT_REQUESTS
         value: "32"
+      - key: MAX_JSON_DEPTH
+        value: "1024"
       - key: MAX_BUFFERED_REQUEST_BYTES
         value: "67108864"
       - key: MAX_BUFFERED_RESPONSE_BYTES

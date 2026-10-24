@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import { randomUUID } from 'node:crypto';
 import { ProxyError } from './errors.js';
 
 export function normalizeKeepaliveUrl(value) {
@@ -17,8 +18,9 @@ export function normalizeKeepaliveUrl(value) {
 }
 
 export function createKeepalive(config, { logger = console } = {}) {
-  let url = config.keepaliveUrl;
+  let url = normalizeKeepaliveUrl(config.keepaliveUrl);
   let intervalMs = config.keepaliveIntervalMs;
+  let revision = randomUUID();
   let started = false;
   let generation = 0;
   let timer;
@@ -93,6 +95,10 @@ export function createKeepalive(config, { logger = console } = {}) {
       });
       outgoing = request;
       request.on('error', error => finish(null, error.code || 'keepalive_connection_error'));
+      request.on('upgrade', (response, socket) => {
+        finish(response.statusCode, 'keepalive_unsupported_upgrade');
+        socket.destroy();
+      });
       request.end();
     } catch (error) {
       finish(null, error.code || 'keepalive_connection_error');
@@ -116,6 +122,7 @@ export function createKeepalive(config, { logger = console } = {}) {
     return {
       configured: Boolean(url), running: started && Boolean(url),
       in_flight: Boolean(outgoing),
+      config_revision: revision,
       interval_seconds: intervalMs / 1000, timeout_seconds: config.keepaliveTimeoutMs / 1000,
       attempts: 0, consecutive_failures: 0, last_attempt_at: null,
       last_status: null, last_ok: null, last_error_code: null, last_duration_ms: null,
@@ -124,7 +131,7 @@ export function createKeepalive(config, { logger = console } = {}) {
   }
 
   function settings() {
-    return { url, interval_seconds: intervalMs / 1000, locked: { ...config.keepaliveEnvLocks }, status: status() };
+    return { url, interval_seconds: intervalMs / 1000, revision, locked: { ...config.keepaliveEnvLocks }, status: status() };
   }
 
   return {
@@ -135,8 +142,11 @@ export function createKeepalive(config, { logger = console } = {}) {
     },
     stop, status, settings,
     update(value) {
-      if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['url', 'interval_seconds'].includes(key))) {
+      if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['url', 'interval_seconds', 'expected_revision'].includes(key))) {
         throw new ProxyError(400, 'invalid_keepalive_settings', 'Expected url and interval_seconds');
+      }
+      if (value.expected_revision !== undefined && (typeof value.expected_revision !== 'string' || !value.expected_revision)) {
+        throw new ProxyError(400, 'invalid_keepalive_revision', 'expected_revision must be a non-empty configuration revision');
       }
       const nextUrl = normalizeKeepaliveUrl(value.url);
       const interval = value.interval_seconds;
@@ -146,10 +156,17 @@ export function createKeepalive(config, { logger = console } = {}) {
       if ((config.keepaliveEnvLocks.url && nextUrl !== url) || (config.keepaliveEnvLocks.interval && interval * 1000 !== intervalMs)) {
         throw new ProxyError(409, 'keepalive_environment_locked', 'KEEPALIVE_URL / KEEPALIVE_INTERVAL are managed by non-empty environment variables; edit them and restart');
       }
+      // Protect configuration edits without tying them to volatile probe status
+      // included in settings(). Legacy callers may omit this optional field.
+      if (value.expected_revision !== undefined && value.expected_revision !== revision) {
+        throw new ProxyError(412, 'keepalive_config_changed', 'Keepalive settings changed; reload the current settings before saving');
+      }
+      if (nextUrl === url && interval * 1000 === intervalMs) return settings();
       const wasStarted = started;
       stop();
       url = nextUrl;
       intervalMs = interval * 1000;
+      revision = randomUUID();
       result = {};
       if (wasStarted) {
         started = true;
