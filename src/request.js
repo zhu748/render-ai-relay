@@ -1,9 +1,9 @@
 import { ProxyError } from './errors.js';
 
-export function readBody(req, { maxBytes, signal, reserve = () => true, tooLargeCode = 'request_too_large', tooLargeMessage = 'Request body exceeds configured limit' }) {
+export function readBody(req, { maxBytes, signal, reserve = () => true, chunked = false, tooLargeCode = 'request_too_large', tooLargeMessage = 'Request body exceeds configured limit' }) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    let size = 0;
+    let size = 0, tailUsed = 0;
     const cleanup = () => {
       req.off('data', data); req.off('end', end); req.off('aborted', aborted); req.off('error', fail);
       signal?.removeEventListener('abort', cancelled);
@@ -23,12 +23,28 @@ export function readBody(req, { maxBytes, signal, reserve = () => true, tooLarge
         req.resume();
         return;
       }
-      chunks.push(chunk);
+      if (!chunked) chunks.push(chunk);
+      else {
+        // Coalesce trickled input into bounded blocks instead of retaining
+        // thousands of tiny Buffer objects and their network allocations.
+        let offset = 0;
+        while (offset < chunk.length) {
+          let tail = chunks.at(-1);
+          if (!tail || tailUsed === tail.length) {
+            tail = Buffer.allocUnsafe(Math.min(65536, maxBytes));
+            chunks.push(tail); tailUsed = 0;
+          }
+          const bytes = Math.min(chunk.length - offset, tail.length - tailUsed);
+          chunk.copy(tail, tailUsed, offset, offset + bytes);
+          offset += bytes; tailUsed += bytes;
+        }
+      }
     };
     const end = () => {
       cleanup();
-      const body = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size);
-      chunks.length = 0;
+      if (chunked && chunks.length) chunks[chunks.length - 1] = chunks.at(-1).subarray(0, tailUsed);
+      const body = chunked ? { chunks, length: size } : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size);
+      if (!chunked) chunks.length = 0;
       resolve(body);
     };
     if (signal?.aborted) { fail(signal.reason); return; }

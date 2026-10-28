@@ -50,7 +50,7 @@ function shutdown() {
     clearTimeout(force);
     await whenIdle();
     clearTimeout(terminate);
-    destroyAgents();
+    await destroyAgents();
   });
 }
 process.on('SIGTERM', shutdown);

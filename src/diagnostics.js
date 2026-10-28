@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import metadata from '../package.json' with { type: 'json' };
 import { ProxyError } from './errors.js';
 import { readBody } from './request.js';
+import { createMetrics } from './metrics.js';
+import { isAdminHost } from './policy.js';
 
 export const VERSION = metadata.version;
 const page = readFileSync(new URL('./admin.html', import.meta.url));
@@ -24,6 +26,9 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
   const settingsUploads = new Set();
   const idleWaiters = new Set();
   let total = 0;
+  let sequence = 0;
+  const streamId = randomUUID();
+  const metrics = createMetrics();
 
   function resolveIdle() {
     if (probes || settingsUploads.size) return;
@@ -42,8 +47,10 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
     // No query, body, cookies, auth headers, or arbitrary header values.
     const base = { request_id: id, method: req.method, path: req.url.split('?', 1)[0].slice(0, 256) };
     const snapshot = () => ({ ...base, elapsed_ms: Math.round(performance.now() - received), ...state() });
+    let ended = false, errorCode;
     function event(name, details = {}, level = 'info') {
-      const entry = { time: new Date().toISOString(), event: name, ...snapshot(), ...details };
+      if (name === 'relay_error') errorCode = details.relay_code || details.code;
+      const entry = { sequence: ++sequence, time: new Date().toISOString(), event: name, ...snapshot(), ...details };
       events.push(entry);
       if (events.length > MAX_EVENTS) events.shift();
       // Observability must not interrupt a working upstream request.
@@ -56,6 +63,9 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
       id,
       event,
       end(outcome) {
+        if (ended) return;
+        ended = true;
+        metrics.observe(snapshot(), outcome, errorCode);
         event('request_finished', { outcome });
         active.delete(id);
       },
@@ -130,11 +140,18 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
   function handle(req, res) {
     const path = req.url.split('?', 1)[0];
     if (path !== '/__proxy' && !path.startsWith('/__proxy/')) return false;
+    if (config.adminHosts?.length && !isAdminHost(req, config)) {
+      if (!req.complete) res.setHeader('connection', 'close');
+      req.resume();
+      json(res, 403, { error: 'Use the configured management host' }, req.method === 'HEAD');
+      return true;
+    }
     const writingKeepalive = path === '/__proxy/keepalive' && req.method === 'PUT';
     if (!writingKeepalive) req.resume();
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('referrer-policy', 'no-referrer');
     res.setHeader('x-frame-options', 'DENY');
+    res.setHeader('cross-origin-opener-policy', 'same-origin');
     const discard = () => {
       if (!req.complete) res.setHeader('connection', 'close');
       req.resume();
@@ -147,7 +164,7 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
       res.setHeader('content-security-policy', "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
       res.writeHead(200, { 'content-type': path.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       res.end(req.method === 'HEAD' ? undefined : path.endsWith('.js') ? script : page);
-    } else if (!['/__proxy/status', '/__proxy/probe', '/__proxy/keepalive'].includes(path)) {
+    } else if (!['/__proxy/status', '/__proxy/metrics', '/__proxy/probe', '/__proxy/keepalive'].includes(path)) {
       json(res, 404, { error: 'Diagnostic route not found' }, req.method === 'HEAD');
     } else if (!config.adminToken) {
       if (writingKeepalive) discard();
@@ -155,7 +172,15 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
     } else if (!matches(req.headers['x-admin-token'], config.adminToken)) {
       if (writingKeepalive) discard();
       json(res, 401, { error: '管理密钥不正确，请填写 Render 环境变量 ADMIN_TOKEN 的值。' }, req.method === 'HEAD');
+    } else if (path === '/__proxy/metrics') {
+      json(res, 200, metrics.snapshot(), req.method === 'HEAD');
     } else if (path === '/__proxy/status') {
+      const params = new URL(req.url, 'http://relay.local').searchParams;
+      const since = params.has('since') ? Number(params.get('since')) : null;
+      if (since !== null && (!/^\d+$/.test(params.get('since')) || !Number.isSafeInteger(since))) {
+        json(res, 400, { error: 'Invalid event cursor' }, req.method === 'HEAD'); return true;
+      }
+      const reset = since === null || since > sequence || (params.has('stream') && params.get('stream') !== streamId) || (events.length && since < events[0].sequence - 1);
       json(res, 200, {
         version: VERSION,
         uptime_seconds: Math.floor((performance.now() - started) / 1000),
@@ -165,10 +190,15 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
         upstream_timeout_ms: config.totalTimeoutMs,
         total_requests: total,
         resources: resourceStats(),
+        metrics: metrics.snapshot(),
+        management_isolated: Boolean(config.adminHosts?.length),
         keepalive: keepalive?.status(),
         diagnostics: { active_probes: probes, active_settings_updates: settingsUploads.size },
         active: [...active.values()].map(snapshot => snapshot()),
-        events: events.slice().reverse(),
+        event_stream_id: streamId,
+        event_cursor: sequence,
+        events_reset: Boolean(reset),
+        events: (reset ? events : events.filter(event => event.sequence > since)).slice().reverse(),
       }, req.method === 'HEAD');
     } else if (path === '/__proxy/keepalive' && !writingKeepalive) {
       json(res, 200, keepalive.settings(), req.method === 'HEAD');
@@ -224,7 +254,7 @@ export function createDiagnostics(config, logger, resourceStats = () => ({}), ke
   }
 
   return {
-    begin, handle,
+    begin, handle, stop() { metrics.stop(); },
     abortRequests(reason) {
       for (const stop of probeStops) stop();
       for (const controller of settingsUploads) if (!controller.signal.aborted) controller.abort(reason);

@@ -81,7 +81,7 @@
     <div class="scroll"><table><thead><tr><th>时间</th><th>请求 ID</th><th>事件</th><th>方法 / 路径</th><th>阶段</th><th>耗时</th><th>心跳</th><th>上游 / 中转 HTTP</th><th>结果 / 原因</th></tr></thead><tbody id="events"><tr><td colspan="9">尚未连接</td></tr></tbody></table></div>
   </section>
   <section>
-    <h2>怎么定位这次 126 秒错误</h2>
+    <h2>排查长时间等待与断连</h2>
     <ol>
       <li>连接后台后，在客户端再次发起一次非流式请求。</li>
       <li>完全没有对应记录：检查客户端请求地址，或网页是否使用原域名直接请求接口。</li>

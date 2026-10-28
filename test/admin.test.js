@@ -30,6 +30,8 @@ function page({ keepalive = { url: '', interval_seconds: 60, locked: { url: fals
   const calls = [];
   const timers = new Set();
   const deadlines = [];
+  const documentListeners = new Map();
+  const document = { hidden: false, getElementById: id => controls.get(id), createElement: element, createTextNode: text => ({ textContent: text }), addEventListener(name, listener) { documentListeners.set(name, listener); } };
   const fetch = (url, options) => new Promise((resolve, reject) => {
     options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
     const call = {
@@ -53,7 +55,7 @@ function page({ keepalive = { url: '', interval_seconds: 60, locked: { url: fals
     if (url === '/__proxy/keepalive' && options.method === 'GET') call.json(keepalive);
   });
   runInNewContext(source, {
-    document: { getElementById: id => controls.get(id), createElement: element, createTextNode: text => ({ textContent: text }) },
+    document,
     fetch, AbortController, TextDecoder, performance, location: { origin: 'https://relay.example' },
     AbortSignal: {
       any: signals => AbortSignal.any(signals),
@@ -62,7 +64,7 @@ function page({ keepalive = { url: '', interval_seconds: 60, locked: { url: fals
     setTimeout(callback, ms) { const timer = { callback, ms }; timers.add(timer); return timer; },
     clearTimeout(timer) { timers.delete(timer); },
   });
-  return { get: id => controls.get(id), calls, timers, deadlines };
+  return { get: id => controls.get(id), calls, timers, deadlines, document, documentListeners };
 }
 
 const emptyStatus = {
@@ -234,4 +236,43 @@ test('conditional admin saves preserve unsaved edits on conflict and offer an ex
   assert.equal(JSON.parse(p.calls.at(-1).options.body).expected_revision, 'new-revision');
   p.get('disconnect').click();
   await flush();
+});
+
+test('incremental event polling preserves older records and resets cleanly across instances', async () => {
+  const p = page();
+  const event = id => ({ request_id: id, method: 'POST', path: '/' + id, phase: 'done', elapsed_ms: 1, heartbeats: 0, event: 'request_finished', time: new Date().toISOString() });
+  p.get('token').value = 'secret'; p.get('connect').click();
+  p.calls[0].json({ ...emptyStatus, event_stream_id: 'one', event_cursor: 1, events_reset: true, events: [event('first')] });
+  await flush();
+  let poll = [...p.timers].at(-1); p.timers.delete(poll); poll.callback();
+  assert.equal(p.calls.at(-1).url, '/__proxy/status?since=1&stream=one');
+  p.calls.at(-1).json({ ...emptyStatus, event_stream_id: 'one', event_cursor: 2, events_reset: false, events: [event('second')] });
+  await flush();
+  assert.equal(p.get('events').children.length, 2);
+  poll = [...p.timers].at(-1); p.timers.delete(poll); poll.callback();
+  p.calls.at(-1).json({ ...emptyStatus, event_stream_id: 'two', event_cursor: 1, events_reset: true, events: [event('third')] });
+  await flush();
+  assert.equal(p.get('events').children.length, 1);
+  assert.equal(p.get('events').children[0].children[1].textContent, 'third');
+  p.get('disconnect').click();
+  p.get('token').value = 'secret'; p.get('connect').click();
+  assert.equal(p.calls.at(-1).url, '/__proxy/status');
+});
+
+test('hidden pages poll less often and visibility changes do not retry rejected credentials', async () => {
+  const p = page();
+  p.document.hidden = true;
+  p.get('token').value = 'secret'; p.get('connect').click();
+  p.calls[0].json(emptyStatus);
+  await flush();
+  assert.equal([...p.timers].at(-1).ms, 30000);
+  p.document.hidden = false;
+  p.documentListeners.get('visibilitychange')();
+  const last = p.calls.at(-1);
+  last.json({ error: 'invalid token' }, 401);
+  await flush();
+  const count = p.calls.length;
+  p.documentListeners.get('visibilitychange')();
+  assert.equal(p.calls.length, count);
+  assert.equal(p.timers.size, 0);
 });

@@ -8,9 +8,10 @@ let connected = false;
 let keepaliveSettings = null;
 let keepaliveController;
 let requests = new Map();
-const phases = { reading_request: '接收请求', waiting_headers: '等待上游响应头', buffering_json: '接收完整 JSON', sending_json: '返回 JSON', sse: '转发 SSE', passthrough: '直接透传', done: '完成' };
+let eventStream = '', eventCursor = 0, recentEvents = [];
+const phases = { reading_request: '接收请求', classifying_request: '识别响应类型', waiting_headers: '等待上游响应头', buffering_json: '接收完整 JSON', sending_json: '返回 JSON', sse: '转发 SSE', passthrough: '直接透传', done: '完成' };
 const names = { request_received: '收到请求', upstream_request: '已转发上游', heartbeat_started: '首个心跳已发出', upstream_headers: '收到上游响应头', late_upstream_status: '上游状态码晚到', relay_error: '中转错误', request_finished: '请求结束' };
-const reasons = { reading_request: '尚在接收请求', enabled: '已启用', disabled: '配置关闭', method: 'HEAD / OPTIONS', range: 'Range 请求', bypass_header: '请求头关闭', path_excluded: '路径未匹配', web_resource: '网页 / 静态资源', upstream_format: '上游格式直接透传' };
+const reasons = { reading_request: '尚在接收请求', enabled: '已启用', disabled: '配置关闭', route_disabled: '路由关闭', method: 'HEAD / OPTIONS', range: 'Range 请求', bypass_header: '请求头关闭', path_excluded: '路径未匹配', web_resource: '网页 / 静态资源', upstream_format: '上游格式直接透传' };
 const seconds = ms => `${(ms / 1000).toFixed(1)} 秒`;
 const shown = value => value ?? '—';
 const mib = bytes => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
@@ -43,6 +44,12 @@ function table(id, rows, width) {
 }
 
 function render(data) {
+  if (data.event_stream_id) {
+    const reset = data.events_reset || data.event_stream_id !== eventStream;
+    recentEvents = (reset ? data.events : [...data.events, ...recentEvents]).slice(0, 200);
+    eventStream = data.event_stream_id; eventCursor = data.event_cursor;
+    data = { ...data, events: recentEvents };
+  }
   renderKeepaliveStatus(data.keepalive);
   const summary = $('summary');
   summary.hidden = false;
@@ -52,6 +59,17 @@ function render(data) {
     cards.push(['请求内存 / 上限', `${mib(data.resources.buffered_request_bytes)} / ${mib(data.resources.max_buffered_request_bytes)}`]);
     cards.push(['响应暂存 / 上限', `${mib(data.resources.buffered_response_bytes)} / ${mib(data.resources.max_buffered_response_bytes)}`]);
     cards.push(['SSE 缓冲 / 上限', `${mib(data.resources.buffered_sse_bytes)} / ${mib(data.resources.max_buffered_sse_bytes)}`]);
+  }
+  if (data.metrics) {
+    cards.push(['进程 RSS', data.metrics.memory.rss_bytes === null ? '当前环境不可读' : mib(data.metrics.memory.rss_bytes)]);
+    cards.push(['JS 堆', mib(data.metrics.memory.heap_used_bytes)]);
+    cards.push(['事件循环 P99', `${data.metrics.event_loop.p99_ms.toFixed(1)} 毫秒`]);
+    cards.push(['中转错误累计', data.metrics.outcomes.relay_error || 0]);
+  }
+  if (data.resources?.temporary_storage) {
+    const storage = data.resources.temporary_storage;
+    cards.push(['待清理文件预算', mib(storage.pending_cleanup_bytes)]);
+    cards.push(['暂存磁盘可用', storage.free_bytes === null ? '尚未检查' : mib(storage.free_bytes)]);
   }
   for (const [label, value] of cards) {
     const card = document.createElement('div');
@@ -63,6 +81,7 @@ function render(data) {
     summary.append(card);
   }
   $('target').textContent = `目标域名：${data.target_origin} · 当前实例运行 ${data.uptime_seconds} 秒`;
+  if (data.management_isolated === false) $('target').textContent += ' · 管理入口与上游网页同域，建议配置 ADMIN_HOSTS 使用独立管理域名。';
   table('active', data.active.map(e => [ e.request_id, `${e.method} ${e.path}`, phases[e.phase] || e.phase, seconds(e.elapsed_ms), e.heartbeats, e.upstream_status, reasons[e.heartbeat_reason] || e.heartbeat_reason ]), 7);
   table('events', data.events.map(e => [ new Date(e.time).toLocaleTimeString(), e.request_id, names[e.event] || e.event, `${e.method} ${e.path}`, phases[e.phase] || e.phase, seconds(e.elapsed_ms), e.heartbeats, `${shown(e.upstream_status)} / ${shown(e.downstream_status)}`, e.code || e.outcome || reasons[e.heartbeat_reason] || e.heartbeat_reason ]), 9);
   const selection = $('request-select').value;
@@ -98,6 +117,8 @@ function showRequest() {
     `SSE 当前缓冲：${record.buffered_sse_bytes ?? 0} 字节`,
     `复用上游连接：${record.upstream_reused_socket ? '是' : '否'}`,
     `正在等待下游读取：${record.downstream_backpressure ? '是' : '否'}`,
+    ...(record.heartbeat_mode ? [`心跳模式：${record.heartbeat_mode}`] : []),
+    ...(record.timings_ms ? Object.entries(record.timings_ms).filter(([, value]) => value !== null).map(([name, value]) => `${name}：${value} 毫秒`) : []),
   ].join('\n');
 }
 $('request-select').addEventListener('change', showRequest);
@@ -176,7 +197,8 @@ async function refresh(current) {
   const controller = new AbortController();
   refreshController = controller;
   try {
-    const response = await fetch('/__proxy/status', { headers: { 'X-Admin-Token': token }, cache: 'no-store', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
+    const path = eventStream ? `/__proxy/status?since=${eventCursor}&stream=${encodeURIComponent(eventStream)}` : '/__proxy/status';
+    const response = await fetch(path, { headers: { 'X-Admin-Token': token }, cache: 'no-store', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
     const data = await response.json();
     if (current !== session) return;
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
@@ -189,7 +211,7 @@ async function refresh(current) {
     $('probe-long').disabled = Boolean(probeController) || draining;
     keepaliveControls();
     if (connected && !keepaliveSettings && !keepaliveController) void keepaliveRequest(current);
-    timer = setTimeout(() => refresh(current), 2000);
+    timer = setTimeout(() => refresh(current), document.hidden ? 30000 : 2000);
   } catch (error) {
     if (current !== session) return;
     connected = false;
@@ -198,7 +220,7 @@ async function refresh(current) {
     $('probe-short').disabled = true;
     $('probe-long').disabled = true;
     // Retry network interruptions; auth/config errors need an explicit reconnect.
-    if (error.name === 'TypeError' || error.name === 'TimeoutError') timer = setTimeout(() => refresh(current), 5000);
+    if (error.name === 'TypeError' || error.name === 'TimeoutError') timer = setTimeout(() => refresh(current), document.hidden ? 30000 : 5000);
   } finally {
     if (refreshController === controller) refreshController = undefined;
   }
@@ -207,6 +229,7 @@ async function refresh(current) {
 $('connect').addEventListener('click', () => {
   const current = ++session;
   connected = false;
+  eventStream = ''; eventCursor = 0; recentEvents = [];
   resetKeepalive();
   clearTimeout(timer);
   refreshController?.abort();
@@ -223,6 +246,7 @@ $('connect').addEventListener('click', () => {
 $('disconnect').addEventListener('click', () => {
   session++;
   connected = false;
+  eventStream = ''; eventCursor = 0; recentEvents = [];
   resetKeepalive();
   clearTimeout(timer);
   refreshController?.abort();
@@ -304,3 +328,9 @@ async function runProbe(duration) {
 $('probe-short').addEventListener('click', () => { void runProbe(10); });
 $('probe-long').addEventListener('click', () => { void runProbe(135); });
 $('probe-stop').addEventListener('click', () => probeController?.abort());
+document.addEventListener?.('visibilitychange', () => {
+  if (!document.hidden && connected && token && !refreshController) {
+    clearTimeout(timer);
+    void refresh(session);
+  }
+});

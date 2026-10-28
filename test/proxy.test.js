@@ -25,7 +25,7 @@ async function waitFor(check) {
   assert.fail('Timed out waiting for observable resource state');
 }
 
-async function fixture(t, handle, overrides = {}, logger = silentLogger) {
+async function fixture(t, handle, overrides = {}, logger = silentLogger, dependencies = {}) {
   const origin = http.createServer((req, res) => {
     Promise.resolve(handle(req, res)).catch(error => res.destroy(error));
   });
@@ -55,7 +55,7 @@ async function fixture(t, handle, overrides = {}, logger = silentLogger) {
     tempDirectory: directory,
     ...overrides,
   };
-  relay = createProxy(config, { logger });
+  relay = createProxy(config, { logger, ...dependencies });
   relay.server.listen(0, '127.0.0.1');
   await once(relay.server, 'listening');
   return { url: `http://127.0.0.1:${relay.server.address().port}`, originUrl: `http://127.0.0.1:${origin.address().port}`, origin, relay, server: relay.server, config, directory };
@@ -1440,4 +1440,132 @@ test('SSE final write queues are destroyed on a stall or shutdown cancellation',
       assert.equal(response.destroyed, true);
     });
   }
+});
+
+test('Accept q=0 does not turn a delayed JSON success into an incompatible SSE response', async t => {
+  const f = await fixture(t, async (_req, res) => {
+    await delay(90);
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+  });
+  const result = await request(f.url + '/v1/chat/completions', { headers: { accept: 'application/json, text/event-stream;q=0' } });
+  assert.match(result.headers['content-type'], /application\/json/);
+  assert.deepEqual(JSON.parse(result.body), { ok: true });
+});
+
+test('heartbeat bypass skips request classification and keeps object-dense input byte exact', async t => {
+  const raw = Buffer.from('{"items":[' + '{},'.repeat(100000) + '{}],"stream":true}');
+  let received;
+  const f = await fixture(t, async (req, res) => { received = await collect(req); res.end('opaque'); });
+  const parse = JSON.parse;
+  let largeParses = 0;
+  JSON.parse = input => { if (typeof input === 'string' && input.length > 1000) largeParses++; return parse(input); };
+  try {
+    const result = await request(f.url + '/v1/chat/completions', { body: raw, headers: { 'x-proxy-heartbeat': 'off' } });
+    assert.equal(result.body.toString(), 'opaque');
+    assert.deepEqual(received, raw);
+    assert.equal(largeParses, 0);
+  } finally { JSON.parse = parse; }
+});
+
+test('after-headers mode preserves a delayed 429 and headers while heartbeating a partial JSON body', async t => {
+  const f = await fixture(t, async (_req, res) => {
+    await delay(80);
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '10', 'x-custom': 'preserved' });
+    res.write('{"error":');
+    await delay(100);
+    res.end('"limited"}');
+  }, { heartbeatMode: 'after-headers' });
+  const result = await request(f.url + '/v1/chat/completions');
+  assert.equal(result.status, 429);
+  assert.equal(result.headers['retry-after'], '10');
+  assert.equal(result.headers['x-custom'], 'preserved');
+  assert.ok(result.times.length >= 2);
+  assert.deepEqual(JSON.parse(result.body), { error: 'limited' });
+});
+
+test('a route can bypass heartbeat and JSON validation without changing other routes', async t => {
+  const f = await fixture(t, async (_req, res) => {
+    await delay(80); res.writeHead(200, { 'content-type': 'application/json' }); res.end('nonstandard json');
+  }, { heartbeatRoutes: [{ prefix: '/raw/', mode: 'off' }] });
+  const raw = await request(f.url + '/raw/custom');
+  assert.equal(raw.body.toString(), 'nonstandard json');
+  const checked = await request(f.url + '/checked');
+  assert.equal(JSON.parse(checked.body).error.code, 'invalid_upstream_json');
+});
+
+test('isolated management hosts serve no upstream content and management paths reject the API host', async t => {
+  let hits = 0;
+  const f = await fixture(t, (_req, res) => { hits++; res.end('upstream'); }, { adminHosts: ['admin.example'], adminToken: 'secret' });
+  assert.equal((await request(f.url + '/__proxy/', { method: 'GET', body: null })).status, 403);
+  assert.equal((await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: { host: 'admin.example', 'x-admin-token': 'secret' } })).status, 200);
+  assert.equal((await request(f.url + '/sw.js', { method: 'GET', body: null, headers: { host: 'admin.example' } })).status, 403);
+  assert.equal((await request(f.url + '/', { method: 'GET', body: null, headers: { host: 'admin.example' } })).status, 403);
+  for (const host of ['ADMIN.EXAMPLE:443', 'admin.example.', 'admin.example:8080']) {
+    assert.equal((await request(f.url + '/sw.js', { method: 'GET', body: null, headers: { host } })).status, 403);
+  }
+  assert.equal(hits, 0);
+  assert.equal((await request(f.url + '/page', { method: 'GET', body: null, headers: { accept: 'text/html' } })).body.toString(), 'upstream');
+});
+
+test('upstream service-worker script requests are blocked before contacting the target', async t => {
+  let hits = 0;
+  const f = await fixture(t, (_req, res) => { hits++; res.end('script'); });
+  for (const headers of [{ 'service-worker': 'script' }, { 'sec-fetch-dest': 'serviceworker' }]) {
+    const result = await request(f.url + '/sw.js', { method: 'GET', body: null, headers });
+    assert.equal(result.status, 403);
+    assert.equal(JSON.parse(result.body).error.code, 'service_worker_blocked');
+  }
+  assert.equal(hits, 0);
+});
+
+test('configured CORS survives early heartbeats and handles preflight without calling upstream', async t => {
+  let hits = 0;
+  const origin = 'https://client.example';
+  const f = await fixture(t, async (_req, res) => {
+    hits++; await delay(80); res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end('{"ok":true}');
+  }, { corsOrigins: [origin], adminToken: 'secret' });
+  const preflight = await request(f.url + '/v1/chat/completions', { method: 'OPTIONS', body: null, headers: { origin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'Authorization, Content-Type, X-Proxy-Token' } });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers['access-control-allow-origin'], origin);
+  assert.match(preflight.headers['access-control-allow-headers'], /authorization/);
+  assert.equal(hits, 0);
+  const result = await request(f.url + '/v1/chat/completions', { headers: { origin } });
+  assert.equal(result.headers['access-control-allow-origin'], origin);
+  assert.deepEqual(JSON.parse(result.body), { ok: true });
+  const denied = await request(f.url + '/v1/chat/completions', { method: 'OPTIONS', body: null, headers: { origin: 'https://untrusted.example', 'access-control-request-method': 'POST' } });
+  assert.equal(denied.status, 403);
+  const admin = await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: { origin, 'x-admin-token': 'secret' } });
+  assert.equal(admin.headers['access-control-allow-origin'], undefined);
+});
+
+test('local response write failures return 503 with a storage code and release capacity', async t => {
+  const f = await fixture(t, (_req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); }, { firstHeartbeatMs: 500, adminToken: 'secret' }, silentLogger, {
+    storageOperations: { createWriteStream() { return new Writable({ write(_chunk, _encoding, callback) { callback(Object.assign(new Error('private/path'), { code: 'ENOSPC' })); } }); } },
+  });
+  const result = await request(f.url + '/test');
+  assert.equal(result.status, 503);
+  assert.equal(result.headers['retry-after'], '1');
+  assert.equal(JSON.parse(result.body).error.code, 'temporary_storage_unavailable');
+  await f.relay.whenIdle();
+  assert.deepEqual(await readdir(f.directory), []);
+  const status = JSON.parse((await request(f.url + '/__proxy/status', { method: 'GET', body: null, headers: { 'x-admin-token': 'secret' } })).body);
+  assert.equal(status.resources.buffered_response_bytes, 0);
+  assert.equal(status.metrics.errors.temporary_storage_unavailable, 1);
+});
+
+test('diagnostic cursors send only new events and cumulative metrics remain available', async t => {
+  const f = await fixture(t, (_req, res) => res.end('ok'), { adminToken: 'secret' });
+  const status = async suffix => JSON.parse((await request(f.url + '/__proxy/status' + suffix, { method: 'GET', body: null, headers: { 'x-admin-token': 'secret' } })).body);
+  await request(f.url + '/first', { headers: { 'x-proxy-heartbeat': 'off' } });
+  const first = await status('');
+  const suffix = `?since=${first.event_cursor}&stream=${first.event_stream_id}`;
+  assert.deepEqual((await status(suffix)).events, []);
+  await request(f.url + '/second', { headers: { 'x-proxy-heartbeat': 'off' } });
+  const second = await status(suffix);
+  assert.ok(second.events.length > 0);
+  assert.ok(second.events.every(event => event.path === '/second'));
+  assert.equal(second.metrics.outcomes.completed, 2);
+  assert.ok(second.metrics.memory.heap_used_bytes > 0);
+  assert.equal((await status(`?since=${first.event_cursor}&stream=old-process`)).events_reset, true);
+  assert.equal((await request(f.url + '/__proxy/metrics', { method: 'GET', body: null })).status, 401);
 });

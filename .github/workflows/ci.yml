@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      long_tests:
+        description: Run the 135-second JSON and SSE checks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,4 +39,60 @@ jobs:
         run: npm run test:slow
         env:
           SMOKE_DELAY_SECONDS: '5'
+          SMOKE_RESPONSE_KIND: sse
+      - name: Verify concurrent admission and resource release
+        run: npm run test:load
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm install --no-save --package-lock=false --ignore-scripts --no-audit --no-fund playwright@1.62.1
+      - run: npx --no-install playwright install --with-deps chromium --only-shell
+      - run: npm run test:browser
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build and check the production image
+        run: |
+          docker build -t render-ai-relay:test .
+          docker run -d --name relay-check --memory=256m -e TARGET_URL=http://127.0.0.1:1 render-ai-relay:test
+          trap 'docker logs relay-check; docker rm -f relay-check' EXIT
+          for attempt in $(seq 1 15); do
+            if docker exec relay-check node -e 'fetch("http://127.0.0.1:10000/__proxy_health").then(async r => { if (!r.ok || !(await r.json()).ok) process.exit(1); }).catch(() => process.exit(1));'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+  long-wait:
+    if: github.event_name == 'workflow_dispatch' && inputs.long_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run test:slow
+      - run: npm run test:slow
+        env:
           SMOKE_RESPONSE_KIND: sse

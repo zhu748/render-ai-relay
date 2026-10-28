@@ -6,12 +6,13 @@ const hex = byte => digit(byte) || (byte >= 65 && byte <= 70) || (byte >= 97 && 
 
 // Validate incrementally without decoding, storing or reserializing the body.
 // Only nesting state and the current token are retained, regardless of size.
-export function createJsonValidator({ maxDepth = 1024 } = {}) {
+export function createJsonValidator({ maxDepth = 1024, inspectStream = false } = {}) {
   const root = { kind: 'root', state: 'value' };
   const stack = [];
   let token = '', numberState = '', literal = '', literalIndex = 0;
   let key = false, escaped = false, unicodeRemaining = 0;
   let utf8Remaining = 0, utf8Min = 128, utf8Max = 191;
+  let rootKeyBytes = null, streamValue;
   const current = () => stack.at(-1) || root;
   const invalid = () => { throw new ProxyError(502, 'invalid_upstream_json', 'Upstream returned invalid or incomplete UTF-8 JSON'); };
   function complete() { const frame = current(); frame.state = frame.kind === 'root' ? 'done' : 'comma'; }
@@ -21,6 +22,18 @@ export function createJsonValidator({ maxDepth = 1024 } = {}) {
   }
   function close() { stack.pop(); complete(); }
   function stringByte(byte) {
+    // Only a short top-level key is decoded. Large values and unknown keys
+    // never become JS strings or object graphs during request classification.
+    if (rootKeyBytes !== null) {
+      const closing = !utf8Remaining && !unicodeRemaining && !escaped && byte === 34;
+      if (closing) {
+        current().isStreamKey = rootKeyBytes.includes(92)
+          ? JSON.parse(Buffer.from([34, ...rootKeyBytes, 34]).toString('utf8')) === 'stream'
+          : rootKeyBytes.length === 6 && rootKeyBytes.every((value, index) => value === 'stream'.charCodeAt(index));
+        rootKeyBytes = null;
+      } else if (rootKeyBytes.length < 64) rootKeyBytes.push(byte);
+      else rootKeyBytes = null;
+    }
     if (utf8Remaining) {
       if (byte < utf8Min || byte > utf8Max) invalid();
       utf8Remaining--;
@@ -75,6 +88,11 @@ export function createJsonValidator({ maxDepth = 1024 } = {}) {
     return true;
   }
   function value(byte) {
+    if (inspectStream && stack.length === 1 && current().kind === 'object' && current().isStreamKey) {
+      // Validation must finish before the caller trusts this candidate. Later
+      // duplicate keys replace earlier values, matching JSON.parse semantics.
+      streamValue = byte === 116;
+    }
     if (byte === 123) open('object');
     else if (byte === 91) open('array');
     else if (byte === 34) { token = 'string'; key = false; }
@@ -86,6 +104,7 @@ export function createJsonValidator({ maxDepth = 1024 } = {}) {
     } else invalid();
   }
   return {
+    get stream() { return streamValue; },
     write(chunk) {
       for (const byte of chunk) {
         if (token === 'string') { stringByte(byte); continue; }
@@ -102,7 +121,10 @@ export function createJsonValidator({ maxDepth = 1024 } = {}) {
           else value(byte);
         } else if (frame.state === 'key' || frame.state === 'first_key') {
           if (frame.state === 'first_key' && byte === 125) close();
-          else if (byte === 34) { token = 'string'; key = true; }
+          else if (byte === 34) {
+            token = 'string'; key = true;
+            if (inspectStream && stack.length === 1) { frame.isStreamKey = false; rootKeyBytes = []; }
+          }
           else invalid();
         } else if (frame.state === 'colon') {
           if (byte !== 58) invalid();

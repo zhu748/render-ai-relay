@@ -43,3 +43,17 @@ test('cancelled upload collection drops its listeners and rejects with the origi
   for (const event of ['data', 'end', 'aborted']) assert.equal(req.listenerCount(event), 0);
   req.destroy();
 });
+
+test('chunked collection coalesces tiny uploads without a full-body concatenation', async () => {
+  const req = incoming();
+  let reserved = 0;
+  const result = readBody(req, { maxBytes: 200000, chunked: true, reserve(bytes) { reserved += bytes; return true; } });
+  for (let i = 0; i < 70000; i++) req.write(Buffer.from([i % 256]));
+  req.end();
+  const received = await result;
+  assert.equal(received.length, 70000);
+  assert.equal(received.chunks.length, 2);
+  assert.equal(reserved, 70000);
+  const raw = Buffer.concat(received.chunks);
+  for (let i = 0; i < raw.length; i++) assert.equal(raw[i], i % 256);
+});

@@ -22,6 +22,16 @@ services:
         value: "1"
       - key: HEARTBEAT_INTERVAL_SECONDS
         value: "1"
+      - key: HEARTBEAT_MODE
+        value: early
+      - key: HEARTBEAT_ROUTES
+        value: "[]"
+      - key: ADMIN_HOSTS
+        value: ""
+      - key: ALLOW_UPSTREAM_SERVICE_WORKERS
+        value: "false"
+      - key: CORS_ORIGINS
+        value: ""
       - key: KEEPALIVE_URL
         value: ""
       - key: KEEPALIVE_INTERVAL
@@ -42,6 +52,10 @@ services:
         value: "25"
       - key: MAX_CONCURRENT_REQUESTS
         value: "32"
+      - key: MAX_REQUEST_BYTES
+        value: "33554432"
+      - key: MAX_JSON_RESPONSE_BYTES
+        value: "268435456"
       - key: MAX_JSON_DEPTH
         value: "1024"
       - key: MAX_BUFFERED_REQUEST_BYTES
@@ -52,3 +66,9 @@ services:
         value: "16777216"
       - key: MAX_BUFFERED_SSE_BYTES
         value: "67108864"
+      - key: TEMP_MIN_FREE_BYTES
+        value: "16777216"
+      - key: TEMP_CLEANUP_RETRY_SECONDS
+        value: "5"
+      - key: MAX_PENDING_TEMP_CLEANUPS
+        value: "64"
